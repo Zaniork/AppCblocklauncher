@@ -333,6 +333,7 @@ jobs:
               static class EntState {
                   int born;
                   int ty;
+                  long pid = NONE;
                   HashMap<String, JSONArray> m = new HashMap<String, JSONArray>();
               }
 
@@ -347,6 +348,7 @@ jobs:
               static class Group {
                   String peer;
                   String target;
+                  long pid = NONE;
                   HashMap<String, Remote> m = new HashMap<String, Remote>();
               }
 
@@ -484,7 +486,7 @@ jobs:
                       File f = new File(d, "config.txt");
                       if (!f.exists()) {
                           FileOutputStream o = new FileOutputStream(f);
-                          o.write(("# 1 = ligado, 0 = desligado (master=0 desliga tudo)\nmaster=1\nplayers=1\nentities=1\nghosts=1\nhand=1\nhandapply=0\nkeepalive=0\nparticles=1\nitems=1\n").getBytes("UTF-8"));
+                          o.write(("# 1 = ligado, 0 = desligado (master=0 desliga tudo)\nmaster=1\nplayers=1\nentities=1\nghosts=1\nhand=1\nhandapply=1\nkeepalive=0\nparticles=1\nitems=1\n").getBytes("UTF-8"));
                           o.close();
                           return;
                       }
@@ -516,6 +518,16 @@ jobs:
               }
 
               /** Registra no maximo 'max' vezes cada tipo de mensagem, para nao encher o log. */
+              static final HashMap<String, Integer> lastLog = new HashMap<String, Integer>();
+
+              /** Registra no maximo uma vez a cada 'every' ticks (para nao esconder problemas que voltam depois). */
+              static void dbgEvery(String key, int every, String s) {
+                  Integer l = lastLog.get(key);
+                  if (l != null && tickN - l.intValue() < every) return;
+                  lastLog.put(key, Integer.valueOf(tickN));
+                  dbg(s);
+              }
+
               static void dbgN(String key, String s, int max) {
                   Integer c = limited.get(key);
                   int n = c == null ? 0 : c.intValue();
@@ -566,14 +578,20 @@ jobs:
                           sb.append(smCall("nativeGetCarriedItem", Integer.valueOf(0)));
                       } catch (Throwable t) { sb.append("?"); }
                       sb.append(" item_que_o_jogo_mostra_no_outro=[");
+                      HashSet<Long> others = new HashSet<Long>();
                       if (ap != null) {
                           for (Object o : new ArrayList<Object>(ap)) {
                               long id = ((Long) o).longValue();
-                              if (id == me) continue;
-                              try {
-                                  sb.append(id).append(":").append(smCall("nativeEntityGetCarriedItem", Long.valueOf(id), Integer.valueOf(0))).append(" ");
-                              } catch (Throwable t) { sb.append(id).append(":? "); }
+                              if (id != me) others.add(Long.valueOf(id));
                           }
+                      }
+                      for (Group g : new ArrayList<Group>(remote.values())) {
+                          if (g.pid != NONE && g.pid != me) others.add(Long.valueOf(g.pid));
+                      }
+                      for (Long id : others) {
+                          try {
+                              sb.append(id).append(":").append(smCall("nativeEntityGetCarriedItem", id, Integer.valueOf(0))).append(" ");
+                          } catch (Throwable t) { sb.append(id).append(":? "); }
                       }
                       sb.append("]");
                       sb.append(" contadores=").append(counters.toString());
@@ -762,13 +780,14 @@ jobs:
                           st = new EntState();
                           st.born = tickN;
                           st.ty = ty;
+                          if (pl) st.pid = e;
                           ents.put(t, st);
                       }
                       JSONArray old = st.m.get(k);
                       if (old != null && old.toString().equals(a.toString())) return;
                       st.m.put(k, a);
                   }
-                  broadcast(eMsg(t, k, a, ty));
+                  broadcast(eMsg(t, k, a, ty, pl ? e : NONE));
               }
 
               static void itemOp(String name, int id, JSONArray op) throws Exception {
@@ -913,10 +932,11 @@ jobs:
                   return j.toString();
               }
 
-              static String eMsg(String target, String k, JSONArray a, int ty) throws Exception {
+              static String eMsg(String target, String k, JSONArray a, int ty, long pid) throws Exception {
                   JSONObject j = new JSONObject();
                   j.put("t", "e");
                   j.put("ty", ty);
+                  if (pid != NONE) j.put("pid", String.valueOf(pid));
                   j.put("T", target);
                   j.put("k", k);
                   j.put("a", a);
@@ -973,7 +993,7 @@ jobs:
                           crea.addAll(creativeList);
                           for (Map.Entry<String, EntState> en : ents.entrySet()) {
                               for (Map.Entry<String, JSONArray> kv : en.getValue().m.entrySet()) {
-                                  es.add(new Object[] { en.getKey(), kv.getKey(), kv.getValue(), Integer.valueOf(en.getValue().ty) });
+                                  es.add(new Object[] { en.getKey(), kv.getKey(), kv.getValue(), Integer.valueOf(en.getValue().ty), Long.valueOf(en.getValue().pid) });
                               }
                           }
                       }
@@ -984,7 +1004,7 @@ jobs:
                       }
                       for (JSONArray op : items) p.out.offer(iMsg(op));
                       for (JSONArray a : crea) p.out.offer(cMsg(a));
-                      for (Object[] e : es) p.out.offer(eMsg((String) e[0], (String) e[1], (JSONArray) e[2], ((Integer) e[3]).intValue()));
+                      for (Object[] e : es) p.out.offer(eMsg((String) e[0], (String) e[1], (JSONArray) e[2], ((Integer) e[3]).intValue(), ((Long) e[4]).longValue()));
                       snapQ.add(p); // mobs locais (fantasmas) sao enviados pela thread do jogo
                   } catch (Throwable t) {
                       log("snapshot", t);
@@ -998,7 +1018,7 @@ jobs:
                   if (!started) {
                       started = true;
                       loadCfg();
-                      dbg("MobSync v8 iniciado, id=" + ID + " config=" + cfg.toString());
+                      dbg("MobSync v9 iniciado, id=" + ID + " config=" + cfg.toString());
                       startNet();
                   }
                   if (!on("master")) return;
@@ -1187,6 +1207,7 @@ jobs:
                       r.ty = j.has("ty") ? j.getInt("ty") : 0;
                       r.born = tickN;
                       g.m.put(k, r);
+                      if (j.has("pid")) g.pid = Long.parseLong(j.getString("pid"));
                       tryApply(g, k, r);
                   } else if (t.equals("i")) {
                       if (on("items")) itemApply(j.getJSONArray("op"));
@@ -1340,15 +1361,17 @@ jobs:
                           Long x = gmap.get(g.peer + ":" + t.substring(2));
                           return x == null ? NONE : x.longValue();
                       }
-                      if (t.startsWith("p:")) return resolvePlayer(t.substring(2));
+                      if (t.startsWith("p:")) return resolvePlayer(t.substring(2), g.pid);
                   } catch (Throwable e) { }
                   return NONE;
               }
 
               /** Acha a entidade do OUTRO jogador. Nunca devolve o proprio jogador (era o que fazia o personagem sumir). */
-              static long resolvePlayer(String key) {
+              static long resolvePlayer(String key, long pid) {
                   try {
                       long me = playerEnt();
+                      // o launcher de quem hospeda NAO registra o jogador que entrou; o id informado por ele e confiavel
+                      if (pid != NONE && pid != me && typeOf(pid) == 63) return pid;
                       if (allPlayers == null) allPlayers = Class.forName(SM).getField("allplayers");
                       List<?> ap = (List<?>) allPlayers.get(null);
                       if (ap == null) return NONE;
@@ -1370,7 +1393,7 @@ jobs:
                               }
                           }
                           if (cand.isEmpty()) {
-                              dbgN("semjogador", "nenhum outro jogador visivel. allplayers=" + ap + " eu=" + me, 8);
+                              dbgEvery("semjogador", 300, "nenhum outro jogador visivel. allplayers=" + ap + " eu=" + me + " pid_informado=" + pid);
                           } else {
                               dbgN("planoB", "outro jogador achado so em allentities: " + cand, 5);
                           }
@@ -1387,11 +1410,11 @@ jobs:
                   if (r.done || r.tries > 100) return;
                   try {
                       long id = resolve(g);
-                      if (id == NONE || !present(id)) {
-                          dbgN("semalvo", "sem alvo ainda para " + g.target + " (" + k + ")", 30);
+                      if (id == NONE || (!present(id) && !g.target.startsWith("p:"))) {
+                          dbgEvery("semalvo", 200, "sem alvo ainda para " + g.target + " (" + k + ")");
                           return;
                       }
-                      if (!g.target.startsWith("p:")) {
+                      if (g.target.startsWith("e:")) {
                           if (id == playerEnt()) return; // nunca mexe no proprio jogador por id de mob
                           int mine = typeOf(id);
                           if (r.ty > 0 && mine > 0 && mine != r.ty) {
@@ -1436,11 +1459,18 @@ jobs:
                       } else if (k.equals("skin")) {
                           invoke(api, "setMobSkinImpl", ent, a.getString(0), Boolean.FALSE);
                       } else if (k.equals("carry") || k.equals("hand")) {
-                          if (k.equals("hand") && !onDef("handapply", false)) {
-                              dbgN("handskip", "item na mao recebido, mas handapply=0 (so diagnostico)", 3);
-                              return true;
-                          }
                           if (a.getInt(0) <= 0) return true;
+                          if (k.equals("hand")) {
+                              if (!onDef("handapply", true)) return true;
+                              try {
+                                  Object cur = smCall("nativeEntityGetCarriedItem", ent, Integer.valueOf(0));
+                                  if (cur instanceof Integer && ((Integer) cur).intValue() == a.getInt(0)) {
+                                      bump("hand:jogo-ja-mostra"); // o proprio jogo ja sincronizou: nao mexe
+                                      return true;
+                                  }
+                              } catch (Throwable t) { }
+                              crumb("item na mao " + a.getInt(0) + " em " + e);
+                          }
                           invoke(api, "setCarriedItem", ent, Integer.valueOf(a.getInt(0)), Integer.valueOf(a.getInt(1)), Integer.valueOf(a.getInt(2)));
                       } else if (k.startsWith("armor")) {
                           invoke(api, "setArmor", ent, Integer.valueOf(a.getInt(0)), Integer.valueOf(a.getInt(1)), Integer.valueOf(a.getInt(2)));
