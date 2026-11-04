@@ -1,0 +1,2401 @@
+name: Build APK com MobSync
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Mantém a mesma assinatura entre builds (senão toda atualização exigiria desinstalar)
+      - name: Restaurar keystore
+        uses: actions/cache@v4
+        with:
+          path: release.jks
+          key: keystore-mobsync-v1
+
+      - name: Localizar o APK
+        run: |
+          APK=$(find . -type f -iname '*.apk' -not -path './.git/*' | head -1)
+          if [ -z "$APK" ]; then echo "ERRO: nenhum .apk no repositório"; exit 1; fi
+          echo "APK encontrado: $APK"
+          echo "APK=$APK" >> $GITHUB_ENV
+
+      - name: Baixar apktool e decompilar (sem mexer nos recursos)
+        run: |
+          curl -fL -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+          java -jar apktool.jar d -r -f "$APK" -o app
+          ls app
+
+      - name: Escrever ModHooks.java
+        run: |
+          mkdir -p src/net/zhuoweizhang/mcpelauncher
+          cat > src/net/zhuoweizhang/mcpelauncher/ModHooks.java <<'JAVA'
+          package net.zhuoweizhang.mcpelauncher;
+
+          import android.content.Context;
+          import org.json.JSONArray;
+
+          /** Pontos de entrada chamados pelo launcher (inseridos por patch no smali). Nunca lançam exceção. */
+          public class ModHooks {
+              static boolean asked = false;
+
+              public static void app(Context c) {
+                  try { ModBus.ctx = c.getApplicationContext(); } catch (Throwable t) { }
+                  try { ModBus.installCrashHandler(); } catch (Throwable t) { }
+                  // Android 6+ com targetSdk 23: permissoes precisam ser pedidas em tempo de execucao
+                  try {
+                      if (android.os.Build.VERSION.SDK_INT >= 23 && c instanceof android.app.Application) {
+                          ((android.app.Application) c).registerActivityLifecycleCallbacks(
+                              new android.app.Application.ActivityLifecycleCallbacks() {
+                                  public void onActivityResumed(android.app.Activity a) {
+                                      if (asked) return;
+                                      asked = true;
+                                      try {
+                                          java.util.ArrayList<String> need = new java.util.ArrayList<String>();
+                                          String[] ps = { "android.permission.WRITE_EXTERNAL_STORAGE", "android.permission.RECORD_AUDIO" };
+                                          for (String p : ps) {
+                                              if (a.checkSelfPermission(p) != android.content.pm.PackageManager.PERMISSION_GRANTED) need.add(p);
+                                          }
+                                          if (!need.isEmpty()) a.requestPermissions(need.toArray(new String[0]), 7001);
+                                      } catch (Throwable t) { }
+                                  }
+                                  public void onActivityCreated(android.app.Activity a, android.os.Bundle b) { }
+                                  public void onActivityStarted(android.app.Activity a) { }
+                                  public void onActivityPaused(android.app.Activity a) { }
+                                  public void onActivityStopped(android.app.Activity a) { }
+                                  public void onActivitySaveInstanceState(android.app.Activity a, android.os.Bundle b) { }
+                                  public void onActivityDestroyed(android.app.Activity a) { }
+                              });
+                      }
+                  } catch (Throwable t) { }
+              }
+
+              public static void tick() {
+                  try { ModBus.tick(); } catch (Throwable t) { ModBus.log("tick", t); }
+              }
+
+              public static void h_rendererCreated(int rid) {
+                  try { ModBus.rendererCreated(rid); } catch (Throwable t) { ModBus.log("rendererCreated", t); }
+              }
+
+              public static void h_nativeModelAddBox(int r, String part, float x, float y, float z, int w, int h, int d,
+                      float scale, int tx, int ty, boolean transparent, float tw, float th) {
+                  try {
+                      JSONArray a = new JSONArray();
+                      a.put("box"); a.put(part);
+                      a.put((double) x); a.put((double) y); a.put((double) z);
+                      a.put(w); a.put(h); a.put(d);
+                      a.put((double) scale);
+                      a.put(tx); a.put(ty);
+                      a.put(transparent);
+                      a.put((double) tw); a.put((double) th);
+                      ModBus.rendererOp(r, a);
+                  } catch (Throwable t) { ModBus.log("addBox", t); }
+              }
+
+              public static void h_nativeModelClear(int r, String part) {
+                  try {
+                      JSONArray a = new JSONArray();
+                      a.put("clr"); a.put(part);
+                      ModBus.rendererOp(r, a);
+                  } catch (Throwable t) { ModBus.log("clear", t); }
+              }
+
+              public static void h_nativeModelSetRotationPoint(int r, String part, float x, float y, float z) {
+                  try {
+                      JSONArray a = new JSONArray();
+                      a.put("rot"); a.put(part);
+                      a.put((double) x); a.put((double) y); a.put((double) z);
+                      ModBus.rendererOp(r, a);
+                  } catch (Throwable t) { ModBus.log("rot", t); }
+              }
+
+              public static void h_nativeSetEntityRenderType(long e, int rid) {
+                  try {
+                      JSONArray a = new JSONArray();
+                      a.put(rid);
+                      ModBus.onEnt(e, "render", a);
+                  } catch (Throwable t) { ModBus.log("render", t); }
+              }
+
+              public static void h_nativeSetMobSkin(long e, String skin) {
+                  try {
+                      JSONArray a = new JSONArray();
+                      a.put(skin);
+                      ModBus.onEnt(e, "skin", a);
+                  } catch (Throwable t) { ModBus.log("skin", t); }
+              }
+
+              public static void h_nativeSetCarriedItem(long e, int id, int count, int dmg) {
+                  try {
+                      JSONArray a = new JSONArray();
+                      a.put(id); a.put(count); a.put(dmg);
+                      ModBus.onEnt(e, "carry", a);
+                  } catch (Throwable t) { ModBus.log("carry", t); }
+              }
+
+              public static void h_nativeMobSetArmor(long e, int slot, int id, int dmg) {
+                  try {
+                      JSONArray a = new JSONArray();
+                      a.put(slot); a.put(id); a.put(dmg);
+                      ModBus.onEnt(e, "armor" + slot, a);
+                  } catch (Throwable t) { ModBus.log("armor", t); }
+              }
+
+              public static void h_nativeSpawnEntity(float x, float y, float z, int type, String skin) {
+                  try { ModBus.spawnArgs(x, y, z, type, skin); } catch (Throwable t) { }
+              }
+
+              public static void h_spawned(long id) {
+                  try { ModBus.spawned(id); } catch (Throwable t) { ModBus.log("spawned", t); }
+              }
+
+              public static void h_nativeRemoveEntity(long e) {
+                  try { ModBus.removed(e); } catch (Throwable t) { ModBus.log("removed", t); }
+              }
+
+                  static void item(String n, int id, Object... v) {
+                  try {
+                      JSONArray a = new JSONArray();
+                      a.put(n);
+                      a.put(id);
+                      for (Object o : v) a.put(o);
+                      ModBus.itemOp(n, id, a);
+                  } catch (Throwable t) { ModBus.log("item", t); }
+              }
+
+              public static void scriptError(Object state, Throwable t) {
+                  try { ModBus.scriptError(state, t); } catch (Throwable x) { }
+              }
+
+              public static void newLevel(boolean hasLevel, boolean remote) {
+                  try { ModBus.newLevel(hasLevel, remote); } catch (Throwable t) { ModBus.log("newLevel", t); }
+              }
+          
+              public static void entityAdded(long e) {
+                  try { ModBus.onEntityAdded(e); } catch (Throwable t) { }
+              }
+          
+              public static void entityRemoved(long e) {
+                  try { ModBus.onEntityRemoved(e); } catch (Throwable t) { }
+              }
+          
+              public static void playerAdded(long e) {
+                  try { ModBus.onPlayerAdded(e); } catch (Throwable t) { }
+              }
+          
+              public static void playerRemoved(long e) {
+                  try { ModBus.onPlayerRemoved(e); } catch (Throwable t) { }
+              }
+          
+              public static void connect(String host, int port) {
+                  try { ModBus.onConnect(host, port); } catch (Throwable t) { }
+              }
+
+              public static void h_nativeDefineItem(int id, String icon, int sub, String name, int max) {
+                  item("nativeDefineItem", id, icon, Integer.valueOf(sub), name, Integer.valueOf(max));
+              }
+
+              public static void h_nativeDefineSnowballItem(int id, String icon, int sub, String name, int max) {
+                  item("nativeDefineSnowballItem", id, icon, Integer.valueOf(sub), name, Integer.valueOf(max));
+              }
+
+              public static void h_nativeDefineArmor(int id, String icon, int sub, String name, String tex, int a, int b, int c) {
+                  item("nativeDefineArmor", id, icon, Integer.valueOf(sub), name, tex, Integer.valueOf(a), Integer.valueOf(b), Integer.valueOf(c));
+              }
+
+              public static void h_nativeItemSetProperties(int id, String json) {
+                  item("nativeItemSetProperties", id, json);
+              }
+
+              public static void h_nativeSetHandEquipped(int id, boolean v) {
+                  item("nativeSetHandEquipped", id, Boolean.valueOf(v));
+              }
+
+              public static void h_nativeSetItemCategory(int id, int cat, int x) {
+                  item("nativeSetItemCategory", id, Integer.valueOf(cat), Integer.valueOf(x));
+              }
+
+              public static void h_nativeSetItemMaxDamage(int id, int dmg) {
+                  item("nativeSetItemMaxDamage", id, Integer.valueOf(dmg));
+              }
+
+              public static void h_nativeItemSetUseAnimation(int id, int anim) {
+                  item("nativeItemSetUseAnimation", id, Integer.valueOf(anim));
+              }
+
+              public static void h_nativeItemSetStackedByData(int id, boolean v) {
+                  item("nativeItemSetStackedByData", id, Boolean.valueOf(v));
+              }
+
+              public static void h_nativeAddItemCreativeInv(int id, int count, int dmg) {
+                  try { ModBus.creativeAdded(id, count, dmg); } catch (Throwable t) { ModBus.log("creativo", t); }
+              }
+
+              public static void h_nativeLevelAddParticle(int type, float x, float y, float z, float vx, float vy, float vz, int size) {
+                  try { ModBus.particle(type, x, y, z, vx, vy, vz, size); } catch (Throwable t) { }
+              }
+          }
+          JAVA
+
+      - name: Escrever ModBus.java
+        run: |
+          cat > src/net/zhuoweizhang/mcpelauncher/ModBus.java <<'JAVA'
+          package net.zhuoweizhang.mcpelauncher;
+
+          import android.content.Context;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.util.Log;
+          import android.widget.Toast;
+          import java.io.BufferedReader;
+          import java.io.FileReader;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.io.PrintWriter;
+          import java.io.StringWriter;
+          import java.lang.reflect.InvocationTargetException;
+          import java.lang.reflect.Method;
+          import java.net.DatagramPacket;
+          import java.net.DatagramSocket;
+          import java.net.InetAddress;
+          import java.net.InetSocketAddress;
+          import java.net.InterfaceAddress;
+          import java.net.NetworkInterface;
+          import java.net.ServerSocket;
+          import java.net.Socket;
+          import java.util.ArrayDeque;
+          import java.util.ArrayList;
+          import java.util.Enumeration;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.Iterator;
+          import java.util.LinkedHashSet;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.UUID;
+          import java.util.concurrent.ConcurrentLinkedQueue;
+          import java.util.concurrent.LinkedBlockingQueue;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          /**
+           * MobSync v3: replica entre aparelhos na mesma rede o que os mods fazem de visual:
+           * modelo 3D, skin, item na mao, armadura, particulas e mobs criados so no cliente (viram "fantasmas" no host).
+           * Tudo e aplicado na thread do jogo (dentro do tick).
+           */
+          public class ModBus {
+              static final String TAG = "ModSync";
+              static final int PORT = 19147;
+              static final String ID = UUID.randomUUID().toString().substring(0, 8);
+              static final String SM = "net.zhuoweizhang.mcpelauncher.ScriptManager";
+              static final String RM = "net.zhuoweizhang.mcpelauncher.api.modpe.RendererManager";
+
+              /** Os IDs de entidade deste launcher sao NEGATIVOS (ex.: -4294967295): nunca usar >0 ou <0 como teste de validade. */
+              static final long NONE = Long.MIN_VALUE;
+              static int epoch = 0;
+
+              static Context ctx;
+              static boolean started = false;
+              static boolean replaying = false;
+              static int tickN = 0;
+              static int opCount = 0;
+              static int rxOps = 0;
+              static final Object lock = new Object();
+
+              // ---- estado local (o que ESTE aparelho fez)
+              static final LinkedHashMap<Integer, ArrayList<JSONArray>> rdefs = new LinkedHashMap<Integer, ArrayList<JSONArray>>();
+              static final HashMap<String, EntState> ents = new HashMap<String, EntState>();
+              static final HashMap<Long, Own> own = new HashMap<Long, Own>(); // so thread do jogo
+              static final ArrayList<double[]> pq = new ArrayList<double[]>(); // particulas pendentes (thread do jogo)
+              static float pX, pY, pZ;
+              static int pType;
+              static String pSkin;
+
+              // ---- rede
+              static final ArrayList<Peer> peers = new ArrayList<Peer>();
+              static final HashSet<String> connecting = new HashSet<String>();
+              static final ConcurrentLinkedQueue<Msg> inbox = new ConcurrentLinkedQueue<Msg>();
+              static final ConcurrentLinkedQueue<String> goneQ = new ConcurrentLinkedQueue<String>();
+              static final ConcurrentLinkedQueue<Peer> snapQ = new ConcurrentLinkedQueue<Peer>();
+
+              // ---- estado recebido (o que OUTROS aparelhos fizeram) - so thread do jogo
+              static final HashMap<String, Integer> rmap = new HashMap<String, Integer>();
+              static final HashMap<String, Integer> minRid = new HashMap<String, Integer>();
+              static int curTries = 0;
+              static final HashMap<String, Group> remote = new HashMap<String, Group>();
+              static final HashMap<String, Long> gmap = new HashMap<String, Long>();
+              static final HashSet<Long> myGhosts = new HashSet<Long>();
+              static final HashSet<Long> hidden = new HashSet<Long>();
+              static final HashMap<String, Long> uuidCache = new HashMap<String, Long>();
+              static final HashMap<String, Method> mcache = new HashMap<String, Method>();
+              static int invisRid = -1;
+              static final LinkedHashMap<Integer, ArrayList<JSONArray>> itemOps = new LinkedHashMap<Integer, ArrayList<JSONArray>>();
+              static final ArrayList<JSONArray> creativeList = new ArrayList<JSONArray>();
+              static final HashSet<Integer> remoteItems = new HashSet<Integer>();
+              static final HashSet<String> creativeApplied = new HashSet<String>();
+              static final HashMap<String, Boolean> cfg = new HashMap<String, Boolean>();
+              static final HashMap<String, Integer> counters = new HashMap<String, Integer>();
+              static final HashMap<String, Integer> limited = new HashMap<String, Integer>();
+              static java.lang.reflect.Field allPlayers;
+              static int lastUuidScan = -100;
+              static java.lang.reflect.Field allEntities;
+              static boolean toastedApply = false;
+
+              static class EntState {
+                  int born;
+                  int ty;
+                  long pid = NONE;
+                  HashMap<String, JSONArray> m = new HashMap<String, JSONArray>();
+              }
+
+              static class Own {
+                  int type;
+                  String skin;
+                  boolean seen;
+                  int born;
+                  float x, y, z, yaw, pitch;
+              }
+
+              static class Group {
+                  String peer;
+                  String target;
+                  long pid = NONE;
+                  HashMap<String, Remote> m = new HashMap<String, Remote>();
+              }
+
+              static class Remote {
+                  int ty;
+                  JSONArray a;
+                  boolean done;
+                  int tries;
+                  int born;
+              }
+
+              static class Msg {
+                  Peer p;
+                  JSONObject j;
+              }
+
+              static class Peer {
+                  final Socket s;
+                  final String id;
+                  final LinkedBlockingQueue<String> out = new LinkedBlockingQueue<String>();
+                  final HashSet<String> fresh = new HashSet<String>();
+                  volatile boolean dead = false;
+
+                  Peer(Socket s, String id) {
+                      this.s = s;
+                      this.id = id;
+                  }
+
+                  void start() {
+                      final Peer self = this;
+                      Thread w = new Thread(new Runnable() {
+                          public void run() {
+                              try {
+                                  OutputStream os = s.getOutputStream();
+                                  while (!dead) {
+                                      String line = out.take();
+                                      os.write((line + "\n").getBytes("UTF-8"));
+                                      os.flush();
+                                  }
+                              } catch (Throwable t) {
+                                  tr("REDE", "thread do peer " + id + " terminou: " + t, 10);
+                              }
+                              self.close();
+                          }
+                      });
+                      w.setDaemon(true);
+                      w.start();
+                      Thread r = new Thread(new Runnable() {
+                          public void run() {
+                              try {
+                                  BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
+                                  String line;
+                                  while ((line = br.readLine()) != null) {
+                                      try {
+                                          Msg m = new Msg();
+                                          m.p = self;
+                                          m.j = new JSONObject(line);
+                                          String mt = m.j.getString("t");
+                                          if (inbox.size() > 40000 && !(mt.equals("r") || mt.equals("o") || mt.equals("i"))) {
+                                              continue; // fila cheia: descarta so efeitos
+                                          }
+                                          inbox.add(m);
+                                      } catch (Throwable t) {
+                                          log("json", t);
+                                      }
+                                  }
+                              } catch (Throwable t) {
+                                  tr("REDE", "thread do peer " + id + " terminou: " + t, 10);
+                              }
+                              self.close();
+                          }
+                      });
+                      r.setDaemon(true);
+                      r.start();
+                  }
+
+                  void close() {
+                      if (dead) return;
+                      dead = true;
+                      try { s.close(); } catch (Throwable t) { }
+                      synchronized (peers) { peers.remove(this); }
+                      try {
+                          Msg bye = new Msg();
+                          bye.p = this;
+                          bye.j = new JSONObject();
+                          bye.j.put("t", "bye");
+                          inbox.add(bye); // mesma fila das mensagens: o "bye" sempre e processado ANTES de qualquer mensagem de uma conexao nova
+                      } catch (Throwable t) { }
+                      dbg("peer desconectado " + id);
+                      toast("ModSync: aparelho desconectado");
+                  }
+              }
+
+              // ------------------------------------------------------------------ utilidades
+
+              static void log(String m, Throwable t) {
+                  try { Log.w(TAG, m + ": " + t); } catch (Throwable x) { }
+                  tr("ERRO", m + ": " + stack(t), 20);
+                  dbg("ERRO " + m + ": " + t);
+              }
+
+              static File dir() {
+                  try {
+                      File d = ctx.getExternalFilesDir(null);
+                      if (d == null) d = ctx.getFilesDir();
+                      File x = new File(d, "modsync");
+                      x.mkdirs();
+                      return x;
+                  } catch (Throwable t) {
+                      return null;
+                  }
+              }
+
+              // ======================= TRACE: diario detalhado (trace.txt, trace.prev.txt, report.txt) =======================
+              static final long T0 = System.currentTimeMillis();
+              static final Object traceLock = new Object();
+              static final ArrayDeque<String> ring = new ArrayDeque<String>();
+              static final HashMap<String, long[]> rate = new HashMap<String, long[]>();
+              static FileOutputStream traceOut;
+              static long traceBytes = 0;
+              static boolean traceOpened = false;
+              static String lastStatus = "";
+              static String prevLast = "";
+              static long tickNsMax = 0, tickNsSum = 0;
+              static int tickCount = 0;
+              static final HashMap<Integer, int[]> opsPerRid = new HashMap<Integer, int[]>();
+              static final HashMap<String, Long> lastRes = new HashMap<String, Long>();
+              static final HashMap<Long, String> lastOther = new HashMap<Long, String>();
+              static int lastHandId = Integer.MIN_VALUE;
+
+              /** Escreve uma linha no trace. Cada categoria tem limite por segundo; o excesso vira uma linha de resumo. */
+              static void tr(String cat, String msg, int perSec) {
+                  try {
+                      long now = System.currentTimeMillis();
+                      synchronized (traceLock) {
+                          long sec = now / 1000L;
+                          long[] r = rate.get(cat);
+                          if (r == null) {
+                              r = new long[3];
+                              rate.put(cat, r);
+                          }
+                          if (r[0] != sec) {
+                              if (r[2] > 0) emit(now, cat, "(" + r[2] + " linhas suprimidas no segundo anterior)");
+                              r[0] = sec;
+                              r[1] = 0;
+                              r[2] = 0;
+                          }
+                          r[1]++;
+                          if (r[1] > perSec) {
+                              r[2]++;
+                              return;
+                          }
+                          emit(now, cat, msg);
+                      }
+                  } catch (Throwable t) { }
+              }
+
+              static void tr(String cat, String msg) {
+                  tr(cat, msg, 40);
+              }
+
+              static void emit(long now, String cat, String msg) throws Exception {
+                  String line = (now - T0) + " t" + tickN + " [" + Thread.currentThread().getName() + "] " + cat + " " + msg + "\n";
+                  ring.addLast(line);
+                  if (ring.size() > 600) ring.removeFirst();
+                  if (!traceOpened) openTrace();
+                  if (traceOut != null) {
+                      byte[] b = line.getBytes("UTF-8");
+                      traceOut.write(b); // sem buffer: o que foi escrito sobrevive a um travamento do jogo
+                      traceBytes += b.length;
+                      if (traceBytes > 2500000L) rotateTrace();
+                  }
+              }
+
+              static void openTrace() {
+                  File d = dir();
+                  if (d == null) return; // sem contexto ainda: por enquanto so fica na memoria
+                  traceOpened = true;
+                  try {
+                      File f = new File(d, "trace.txt");
+                      if (f.exists()) {
+                          File prev = new File(d, "trace.prev.txt");
+                          if (prev.exists()) prev.delete();
+                          f.renameTo(prev);
+                      }
+                      traceOut = new FileOutputStream(new File(d, "trace.txt"), false);
+                      traceBytes = 0;
+                  } catch (Throwable t) {
+                      traceOut = null;
+                  }
+              }
+
+              static void rotateTrace() {
+                  try {
+                      traceOut.close();
+                      File d = dir();
+                      File f = new File(d, "trace.txt");
+                      File old = new File(d, "trace.1.txt");
+                      if (old.exists()) old.delete();
+                      f.renameTo(old);
+                      traceOut = new FileOutputStream(new File(d, "trace.txt"), false);
+                      traceBytes = 0;
+                  } catch (Throwable t) {
+                      traceOut = null;
+                  }
+              }
+
+              static String cut(String s, int n) {
+                  return s.length() <= n ? s : s.substring(0, n) + "...";
+              }
+
+              static String stack(Throwable t) {
+                  StringBuilder sb = new StringBuilder(String.valueOf(t));
+                  try {
+                      StackTraceElement[] st = t.getStackTrace();
+                      for (int i = 0; i < st.length && i < 8; i++) sb.append("\n    at ").append(st[i]);
+                  } catch (Throwable x) { }
+                  return sb.toString();
+              }
+
+              static String mem() {
+                  Runtime r = Runtime.getRuntime();
+                  return "mem_usada=" + ((r.totalMemory() - r.freeMemory()) >> 20) + "MB mem_max=" + (r.maxMemory() >> 20) + "MB threads=" + Thread.activeCount();
+              }
+
+              /** Um unico arquivo para me mandar: cabecalho + estado + ultimas ~600 linhas do trace. Reescrito a cada 30 s e no travamento. */
+              static void writeReport(String why) {
+                  try {
+                      File d = dir();
+                      if (d == null) return;
+                      StringBuilder sb = new StringBuilder();
+                      sb.append("=== RELATORIO MobSync (").append(why).append(") ===\n");
+                      sb.append("versao=").append(BuildInfo.VERSION).append(" id=").append(ID).append(" t=").append(System.currentTimeMillis() - T0).append("ms tick=").append(tickN).append("\n");
+                      sb.append("aparelho=").append(Build.MODEL).append(" android=").append(Build.VERSION.RELEASE).append(" sdk=").append(Build.VERSION.SDK_INT).append("\n");
+                      try { sb.append("pacote=").append(ctx.getPackageName()).append("\n"); } catch (Throwable t) { }
+                      sb.append("config=").append(cfg).append("\n");
+                      sb.append("ganchos aplicados neste APK:\n").append(BuildInfo.REPORT).append("\n");
+                      sb.append("ultima operacao da sessao anterior=").append(prevLast).append("\n");
+                      sb.append("ultimo_status=").append(lastStatus).append("\n");
+                      sb.append("--- ultimas linhas do trace ---\n");
+                      synchronized (traceLock) {
+                          for (String l : ring) sb.append(l);
+                      }
+                      FileOutputStream o = new FileOutputStream(new File(d, "report.txt"), false);
+                      o.write(sb.toString().getBytes("UTF-8"));
+                      o.close();
+                  } catch (Throwable t) { }
+              }
+
+              static void startSession() {
+                  try {
+                      File d = dir();
+                      if (d != null) {
+                          File lf = new File(d, "last.txt");
+                          if (lf.exists()) {
+                              java.io.FileInputStream in = new java.io.FileInputStream(lf);
+                              byte[] b = new byte[(int) Math.min(lf.length(), 400L)];
+                              int n = in.read(b);
+                              in.close();
+                              prevLast = new String(b, 0, Math.max(n, 0), "UTF-8");
+                          }
+                      }
+                  } catch (Throwable t) { }
+                  loadCfg();
+                  tr("SESSAO", "MobSync " + BuildInfo.VERSION + " id=" + ID + " aparelho=" + Build.MODEL + " android=" + Build.VERSION.RELEASE + " sdk=" + Build.VERSION.SDK_INT, 100);
+                  tr("SESSAO", "config=" + cfg + " " + mem(), 100);
+                  tr("SESSAO", "ultima operacao da sessao anterior (last.txt)=" + prevLast, 100);
+                  for (String l : BuildInfo.REPORT.split("\\n")) tr("PATCH", l, 200);
+              }
+
+              static void trResolve(String key, long res, String why) {
+                  Long old = lastRes.get(key);
+                  if (old != null && old.longValue() == res) return;
+                  lastRes.put(key, Long.valueOf(res));
+                  tr("RESOLVER", "jogador " + key + " -> " + (res == NONE ? "NENHUM" : String.valueOf(res)) + " (" + why + ")", 30);
+              }
+
+              // ---- eventos do launcher (inseridos por patch no smali)
+              static void onEntityAdded(long e) {
+                  bump("ent+");
+                  try {
+                      int ty = typeOf(e);
+                      tr("ENT+", "id=" + e + " tipo=" + ty + (ty == 63 ? " (JOGADOR)" : "") + " eu=" + playerEnt(), 80);
+                  } catch (Throwable t) { }
+              }
+
+              static void onEntityRemoved(long e) {
+                  bump("ent-");
+                  tr("ENT-", "id=" + e, 80);
+              }
+
+              static void onPlayerAdded(long e) {
+                  tr("JOGADOR+", "registrado no launcher id=" + e + " nome=" + nameOf(e) + " eu=" + playerEnt(), 30);
+              }
+
+              static void onPlayerRemoved(long e) {
+                  tr("JOGADOR-", "removido id=" + e, 30);
+              }
+
+              static void onConnect(String host, int port) {
+                  tr("JOGO-REDE", "este celular esta ENTRANDO no servidor " + host + ":" + port, 10);
+              }
+
+              static void pollOther() throws Exception {
+                  long me = playerEnt();
+                  HashSet<Long> others = new HashSet<Long>();
+                  try {
+                      if (allPlayers == null) allPlayers = Class.forName(SM).getField("allplayers");
+                      List<?> ap = (List<?>) allPlayers.get(null);
+                      if (ap != null) {
+                          for (Object o : new ArrayList<Object>(ap)) {
+                              long id = ((Long) o).longValue();
+                              if (id != me) others.add(Long.valueOf(id));
+                          }
+                      }
+                  } catch (Throwable t) { }
+                  for (Group g : new ArrayList<Group>(remote.values())) {
+                      if (g.pid != NONE && g.pid != me) others.add(Long.valueOf(g.pid));
+                  }
+                  for (Long id : others) {
+                      long i = id.longValue();
+                      int ty = typeOf(i);
+                      String item = "?";
+                      if (ty == 63 || present(i)) {
+                          try {
+                              item = smCall("nativeEntityGetCarriedItem", id, Integer.valueOf(0)) + "/" + smCall("nativeEntityGetCarriedItem", id, Integer.valueOf(1)) + "/" + smCall("nativeEntityGetCarriedItem", id, Integer.valueOf(2));
+                          } catch (Throwable t) { item = "erro"; }
+                      }
+                      String st = "tipo=" + ty + " presente_na_lista=" + present(i) + " item_que_o_jogo_mostra(id/dmg/qtd)=" + item;
+                      String old = lastOther.get(id);
+                      if (!st.equals(old)) {
+                          lastOther.put(id, st);
+                          tr("OUTRO-JOGADOR", "id=" + i + " " + st, 30);
+                      }
+                  }
+              }
+
+              /** Ultima operacao feita (sobrescreve): se o jogo fechar de repente, este arquivo mostra o que estava rodando. */
+              static void crumb(String s) {
+                  try {
+                      File d = dir();
+                      if (d == null) return;
+                      FileOutputStream f = new FileOutputStream(new File(d, "last.txt"), false);
+                      f.write((tickN + " " + s).getBytes("UTF-8"));
+                      f.close();
+                  } catch (Throwable t) { }
+              }
+
+              /** Diario de eventos importantes (limitado a ~300 KB). */
+              static void dbg(String s) {
+                  tr("EVT", s, 100);
+                  try {
+                      File d = dir();
+                      if (d == null) return;
+                      File f = new File(d, "log.txt");
+                      if (f.length() > 300000) return;
+                      FileOutputStream o = new FileOutputStream(f, true);
+                      o.write((tickN + " " + s + "\n").getBytes("UTF-8"));
+                      o.close();
+                  } catch (Throwable t) { }
+              }
+
+              static void loadCfg() {
+                  try {
+                      File d = dir();
+                      if (d == null) return;
+                      File f = new File(d, "config.txt");
+                      if (!f.exists()) {
+                          FileOutputStream o = new FileOutputStream(f);
+                          o.write(("# 1 = ligado, 0 = desligado (master=0 desliga tudo)\nmaster=1\nplayers=1\nentities=1\nghosts=1\nhand=1\nhandapply=1\nkeepalive=0\nparticles=1\nitems=1\n").getBytes("UTF-8"));
+                          o.close();
+                          return;
+                      }
+                      BufferedReader br = new BufferedReader(new FileReader(f));
+                      String line;
+                      while ((line = br.readLine()) != null) {
+                          line = line.trim();
+                          if (line.startsWith("#") || line.indexOf('=') < 0) continue;
+                          String[] kv = line.split("=", 2);
+                          cfg.put(kv[0].trim(), Boolean.valueOf(!kv[1].trim().equals("0")));
+                      }
+                      br.close();
+                  } catch (Throwable t) { }
+              }
+
+              static boolean on(String k) {
+                  Boolean b = cfg.get(k);
+                  return b == null || b.booleanValue();
+              }
+
+              static boolean onDef(String k, boolean def) {
+                  Boolean b = cfg.get(k);
+                  return b == null ? def : b.booleanValue();
+              }
+
+              static void bump(String k) {
+                  Integer c = counters.get(k);
+                  counters.put(k, Integer.valueOf(c == null ? 1 : c.intValue() + 1));
+              }
+
+              /** Registra no maximo 'max' vezes cada tipo de mensagem, para nao encher o log. */
+              static final HashMap<String, Integer> lastLog = new HashMap<String, Integer>();
+
+              /** Registra no maximo uma vez a cada 'every' ticks (para nao esconder problemas que voltam depois). */
+              static void dbgEvery(String key, int every, String s) {
+                  Integer l = lastLog.get(key);
+                  if (l != null && tickN - l.intValue() < every) return;
+                  lastLog.put(key, Integer.valueOf(tickN));
+                  dbg(s);
+              }
+
+              static void dbgN(String key, String s, int max) {
+                  Integer c = limited.get(key);
+                  int n = c == null ? 0 : c.intValue();
+                  if (n >= max) return;
+                  limited.put(key, Integer.valueOf(n + 1));
+                  dbg(s);
+              }
+
+              static void status() {
+                  try {
+                      StringBuilder sb = new StringBuilder();
+                      long me = playerEnt();
+                      sb.append("STATUS remoto=").append(isRemote()).append(" eu=").append(me);
+                      sb.append(" nome=").append(nameOf(me)).append(" uuid=").append(uuidOf(me));
+                      sb.append(" peers=").append(peers.size()).append(" jogadores=[");
+                      if (allPlayers == null) allPlayers = Class.forName(SM).getField("allplayers");
+                      List<?> ap = (List<?>) allPlayers.get(null);
+                      if (ap != null) {
+                          for (Object o : new ArrayList<Object>(ap)) {
+                              long id = ((Long) o).longValue();
+                              sb.append(id).append(":").append(nameOf(id)).append(":").append(uuidOf(id)).append(" ");
+                          }
+                      }
+                      sb.append("] pronto=").append(ready());
+                      try {
+                          java.lang.reflect.Field fs = Class.forName(SM).getDeclaredField("scriptingEnabled");
+                          fs.setAccessible(true);
+                          sb.append(" scripts_ligados=").append(fs.getBoolean(null));
+                      } catch (Throwable t) { sb.append(" scripts_ligados=?"); }
+                      try {
+                          java.lang.reflect.Field fl = Class.forName(SM).getDeclaredField("scripts");
+                          fl.setAccessible(true);
+                          List<?> sl = (List<?>) fl.get(null);
+                          sb.append(" scripts=[");
+                          if (sl != null) {
+                              for (Object st : new ArrayList<Object>(sl)) {
+                                  java.lang.reflect.Field fn = st.getClass().getDeclaredField("name");
+                                  fn.setAccessible(true);
+                                  java.lang.reflect.Field fe = st.getClass().getDeclaredField("errors");
+                                  fe.setAccessible(true);
+                                  sb.append(fn.get(st)).append(":erros=").append(fe.getInt(st)).append(" ");
+                              }
+                          }
+                          sb.append("]");
+                      } catch (Throwable t) { sb.append(" scripts=?"); }
+                      sb.append(" item_que_EU_seguro=");
+                      try {
+                          sb.append(smCall("nativeGetCarriedItem", Integer.valueOf(0)));
+                      } catch (Throwable t) { sb.append("?"); }
+                      sb.append(" item_que_o_jogo_mostra_no_outro=[");
+                      HashSet<Long> others = new HashSet<Long>();
+                      if (ap != null) {
+                          for (Object o : new ArrayList<Object>(ap)) {
+                              long id = ((Long) o).longValue();
+                              if (id != me) others.add(Long.valueOf(id));
+                          }
+                      }
+                      for (Group g : new ArrayList<Group>(remote.values())) {
+                          if (g.pid != NONE && g.pid != me) others.add(Long.valueOf(g.pid));
+                      }
+                      for (Long id : others) {
+                          try {
+                              sb.append(id).append(":").append(smCall("nativeEntityGetCarriedItem", id, Integer.valueOf(0))).append(" ");
+                          } catch (Throwable t) { sb.append(id).append(":? "); }
+                      }
+                      sb.append("]");
+                      sb.append(" ").append(mem());
+                      sb.append(" tick_medio_ms=").append(tickCount == 0 ? 0.0 : (tickNsSum / (double) tickCount) / 1000000.0);
+                      sb.append(" tick_max_ms=").append(tickNsMax / 1000000.0);
+                      tickNsSum = 0;
+                      tickNsMax = 0;
+                      tickCount = 0;
+                      sb.append(" inbox=").append(inbox.size()).append(" fantasmas=").append(gmap.size()).append(" meus_mobs_locais=").append(own.size());
+                      sb.append(" grupos_remotos=").append(remote.size()).append(" renderers_meus=").append(rdefs.size()).append(" renderers_remotos=").append(rmap.size());
+                      try {
+                          if (allEntities == null) allEntities = Class.forName(SM).getField("allentities");
+                          List<?> all = (List<?>) allEntities.get(null);
+                          HashMap<Integer, Integer> hist = new HashMap<Integer, Integer>();
+                          if (all != null) {
+                              for (Object o : new ArrayList<Object>(all)) {
+                                  Integer ty = Integer.valueOf(typeOf(((Long) o).longValue()));
+                                  Integer c = hist.get(ty);
+                                  hist.put(ty, Integer.valueOf(c == null ? 1 : c.intValue() + 1));
+                              }
+                          }
+                          sb.append(" total_entidades=").append(all == null ? -1 : all.size()).append(" entidades_por_tipo=").append(hist);
+                      } catch (Throwable t) { }
+                      sb.append(" contadores=").append(counters.toString());
+                      lastStatus = sb.toString();
+                      dbg(lastStatus);
+                      writeReport("status");
+                  } catch (Throwable t) { dbg("STATUS erro " + t); }
+              }
+
+              static void installCrashHandler() {
+                  try {
+                      final Thread.UncaughtExceptionHandler old = Thread.getDefaultUncaughtExceptionHandler();
+                      Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+                          public void uncaughtException(Thread t, Throwable e) {
+                              try {
+                                  StringWriter sw = new StringWriter();
+                                  e.printStackTrace(new PrintWriter(sw));
+                                  File d = dir();
+                                  if (d != null) {
+                                      FileOutputStream o = new FileOutputStream(new File(d, "crash.txt"), true);
+                                      o.write(("=== tick " + tickN + " thread " + t.getName() + "\n" + sw.toString() + "\n").getBytes("UTF-8"));
+                                      o.close();
+                                  }
+                              } catch (Throwable x) { }
+                              try { tr("CRASH", stack(e), 5); writeReport("CRASH " + e); } catch (Throwable x) { }
+                              if (old != null) old.uncaughtException(t, e);
+                          }
+                      });
+                  } catch (Throwable t) { }
+              }
+
+              static void toast(final String msg) {
+                  try {
+                      final Context c = ctx;
+                      if (c == null) return;
+                      new Handler(Looper.getMainLooper()).post(new Runnable() {
+                          public void run() {
+                              try { Toast.makeText(c, msg, Toast.LENGTH_LONG).show(); } catch (Throwable t) { }
+                          }
+                      });
+                  } catch (Throwable t) { }
+              }
+
+              static Method find(Class<?> c, String name, int arity) throws Exception {
+                  String k = c.getName() + "#" + name + "/" + arity;
+                  Method m = mcache.get(k);
+                  if (m != null) return m;
+                  for (Method x : c.getDeclaredMethods()) {
+                      if (x.getName().equals(name) && x.getParameterTypes().length == arity) {
+                          x.setAccessible(true);
+                          mcache.put(k, x);
+                          return x;
+                      }
+                  }
+                  throw new NoSuchMethodException(k);
+              }
+
+              static Object invoke(Class<?> c, String name, Object... args) throws Exception {
+                  Method m = find(c, name, args.length);
+                  try {
+                      return m.invoke(null, args);
+                  } catch (InvocationTargetException ite) {
+                      throw new Exception(String.valueOf(ite.getCause()));
+                  }
+              }
+
+              static Object smCall(String name, Object... args) throws Exception {
+                  return invoke(Class.forName(SM), name, args);
+              }
+
+              static Object rmCall(String name, Object... args) throws Exception {
+                  return invoke(Class.forName(RM), name, args);
+              }
+
+              static boolean isRemote() {
+                  try {
+                      if (Class.forName(SM).getField("isRemote").getBoolean(null)) return true;
+                  } catch (Throwable t) { }
+                  try { return ((Boolean) smCall("nativeLevelIsRemote")).booleanValue(); } catch (Throwable t) { return false; }
+              }
+
+              static long playerEnt() {
+                  try { return ((Long) smCall("nativeGetPlayerEnt")).longValue(); } catch (Throwable t) { return NONE; }
+              }
+
+              static boolean present(long e) {
+                  try {
+                      if (allEntities == null) {
+                          allEntities = Class.forName(SM).getField("allentities");
+                      }
+                      List<?> l = (List<?>) allEntities.get(null);
+                      return l != null && l.contains(Long.valueOf(e));
+                  } catch (Throwable t) {
+                      return false;
+                  }
+              }
+
+              /** Mundo carregado e jogador presente. Fora disso nenhuma chamada nativa e feita (era um risco de travamento ao entrar/sair). */
+              static boolean ready() {
+                  long pe = playerEnt();
+                  return pe != NONE && present(pe);
+              }
+
+              static boolean isPlayer(long e) {
+                  try {
+                      Object r = invoke(Class.forName(SM + "$NativePlayerApi"), "isPlayer", Long.valueOf(e));
+                      return r instanceof Boolean && ((Boolean) r).booleanValue();
+                  } catch (Throwable t) {
+                      return false;
+                  }
+              }
+
+              /** Entidade que e jogador por qualquer fonte: lista de jogadores do launcher ou id informado por um aparelho remoto. */
+              static boolean isKnownPlayer(long e) {
+                  try {
+                      if (allPlayers == null) allPlayers = Class.forName(SM).getField("allplayers");
+                      List<?> ap = (List<?>) allPlayers.get(null);
+                      if (ap != null && ap.contains(Long.valueOf(e))) return true;
+                  } catch (Throwable t) { }
+                  for (Group g : new ArrayList<Group>(remote.values())) {
+                      if (g.target.startsWith("p:") && g.pid == e) return true;
+                  }
+                  return false;
+              }
+              static String uuidOf(long e) {
+                  try {
+                      Object o = smCall("nativeEntityGetUUID", Long.valueOf(e));
+                      if (!(o instanceof long[])) return null;
+                      long[] a = (long[]) o;
+                      if (a.length < 2 || (a[0] == 0 && a[1] == 0)) return null;
+                      return Long.toHexString(a[0]) + "-" + Long.toHexString(a[1]);
+                  } catch (Throwable t) {
+                      return null;
+                  }
+              }
+
+              static int typeOf(long e) {
+                  try {
+                      Object r = invoke(Class.forName(SM + "$NativeEntityApi"), "getEntityTypeId", Long.valueOf(e));
+                      return r instanceof Integer ? ((Integer) r).intValue() : -1;
+                  } catch (Throwable t) {
+                      return -1;
+                  }
+              }
+
+              static String nameOf(long e) {
+                  try {
+                      Object r = smCall("nativeGetPlayerName", Long.valueOf(e));
+                      return r == null ? null : String.valueOf(r);
+                  } catch (Throwable t) {
+                      return null;
+                  }
+              }
+
+              static String playerKey(long e) {
+                  String u = uuidOf(e);
+                  if (u != null) return u;
+                  String n = nameOf(e);
+                  return n != null ? "n-" + n : "?";
+              }
+
+              /** Identifica a entidade de um jeito que vale nos dois aparelhos. */
+              static String targetOf(long e) {
+                  long pe = playerEnt();
+                  if (pe != NONE && e == pe) return "p:" + playerKey(e);
+                  if (own.containsKey(Long.valueOf(e))) return "o:" + e;
+                  return "e:" + e;
+              }
+
+              // ------------------------------------------------------------------ registro local (chamado pelos hooks)
+
+              static void rendererCreated(int rid) throws Exception {
+                  synchronized (lock) {
+                      rdefs.put(Integer.valueOf(rid), new ArrayList<JSONArray>());
+                  }
+                  opsPerRid.put(Integer.valueOf(rid), new int[1]);
+                  tr("MODELO", "renderer criado rid=" + rid + " (peers=" + peers.size() + ")", 30);
+                  broadcast(rMsg(rid));
+              }
+
+              static void rendererOp(int rid, JSONArray op) throws Exception {
+                  synchronized (lock) {
+                      ArrayList<JSONArray> l = rdefs.get(Integer.valueOf(rid));
+                      if (l == null || opCount > 300000) return;
+                      l.add(op);
+                      opCount++;
+                      int[] oc = opsPerRid.get(Integer.valueOf(rid));
+                      if (oc != null) oc[0]++;
+                      if ((opCount & 255) == 0) bump("hook:modelo256");
+                  }
+                  broadcast(oMsg(rid, op));
+              }
+
+              static void onEnt(long e, String k, JSONArray a) throws Exception {
+                  if (replaying || !on("master")) return;
+                  String t = targetOf(e);
+                  boolean pl = t.startsWith("p:");
+                  if (pl && !on("players")) return;
+                  if (!pl && !on("entities")) return;
+                  bump("hook:" + k + (pl ? ":jogador" : ":mob"));
+                  int ty = pl ? 0 : typeOf(e);
+                  if (!pl && (ty == 63 || isPlayer(e))) { bump("hook:ignorado-jogador-remoto"); return; }
+                  synchronized (lock) {
+                      EntState st = ents.get(t);
+                      if (st == null) {
+                          st = new EntState();
+                          st.born = tickN;
+                          st.ty = ty;
+                          if (pl) st.pid = e;
+                          ents.put(t, st);
+                      }
+                      JSONArray old = st.m.get(k);
+                      if (old != null && old.toString().equals(a.toString())) {
+                          bump("dedupe:" + k);
+                          return;
+                      }
+                      st.m.put(k, a);
+                  }
+                  String extra = "";
+                  if (k.equals("render")) {
+                      int[] oc = opsPerRid.get(Integer.valueOf(a.getInt(0)));
+                      extra = " modelo_ops=" + (oc == null ? "desconhecido(vanilla?)" : String.valueOf(oc[0]));
+                  }
+                  tr("HOOK", "id=" + e + " alvo=" + t + " k=" + k + " a=" + a + " tipo=" + ty + extra + " peers=" + peers.size(), 60);
+                  broadcast(eMsg(t, k, a, ty, pl ? e : NONE));
+              }
+
+              static void itemOp(String name, int id, JSONArray op) throws Exception {
+                  if (replaying || !on("items") || !on("master")) return;
+                  synchronized (lock) {
+                      ArrayList<JSONArray> l = itemOps.get(Integer.valueOf(id));
+                      if (l == null) {
+                          l = new ArrayList<JSONArray>();
+                          itemOps.put(Integer.valueOf(id), l);
+                      }
+                      l.add(op);
+                  }
+                  tr("ITEM", "definicao " + cut(op.toString(), 200), 50);
+                  bump("hook:item");
+                  broadcast(iMsg(op));
+              }
+
+              static void creativeAdded(int id, int count, int dmg) throws Exception {
+                  if (replaying || !on("items") || !on("master")) return;
+                  JSONArray a = new JSONArray();
+                  a.put(id);
+                  a.put(count);
+                  a.put(dmg);
+                  creativeApplied.add(id + ":" + dmg); // este aparelho ja adicionou (neste mundo)
+                  tr("ITEM", "criativo id=" + id + " qtd=" + count + " dmg=" + dmg, 50);
+                  synchronized (lock) { creativeList.add(a); }
+                  bump("hook:criativo");
+                  broadcast(cMsg(a));
+              }
+
+              /** Chamado no inicio de cada mundo novo: ids de entidade recomecam, entao o estado por entidade e descartado. */
+              /** O launcher desliga um script apos 5 erros. Aqui registramos cada erro (nome, mensagem e onde) e, se keepalive=1, zeramos o contador. */
+              static void scriptError(Object state, Throwable t) {
+                  String name = "?";
+                  int errs = -1;
+                  try {
+                      java.lang.reflect.Field fn = state.getClass().getDeclaredField("name");
+                      fn.setAccessible(true);
+                      name = String.valueOf(fn.get(state));
+                      java.lang.reflect.Field fe = state.getClass().getDeclaredField("errors");
+                      fe.setAccessible(true);
+                      errs = fe.getInt(state) + 1;
+                      if (onDef("keepalive", false)) fe.setInt(state, 0);
+                  } catch (Throwable x) { }
+                  bump("erroDeScript");
+                  String top = "";
+                  try {
+                      StackTraceElement[] st = t.getStackTrace();
+                      if (st.length > 0) top = st[0].toString();
+                  } catch (Throwable x) { }
+                  dbgN("scripterr", "ERRO DE SCRIPT '" + name + "' (n=" + errs + "): " + t + " @ " + top, 60);
+              }
+
+              static void newLevel(boolean hasLevel, boolean remoteLevel) {
+                  tr("MUNDO", "setLevelFakeCallback hasLevel=" + hasLevel + " mundo_remoto=" + remoteLevel + " epoca=" + (epoch + 1) + " eu=" + playerEnt(), 20);
+                  epoch++;
+                  creativeApplied.clear();
+                  gmap.clear();
+                  myGhosts.clear();
+                  hidden.clear();
+                  own.clear();
+                  pq.clear();
+                  synchronized (lock) {
+                      Iterator<Map.Entry<String, EntState>> it = ents.entrySet().iterator();
+                      while (it.hasNext()) {
+                          if (!it.next().getKey().startsWith("p:")) it.remove();
+                      }
+                      // o mod recria a lista do criativo a cada mundo: guardamos so a mais recente
+                      creativeList.clear();
+                  }
+                  Iterator<Map.Entry<String, Group>> gi = remote.entrySet().iterator();
+                  while (gi.hasNext()) {
+                      if (!gi.next().getValue().target.startsWith("p:")) gi.remove();
+                  }
+                  dbg("novo mundo (epoca " + epoch + ")");
+              }
+
+              static void spawnArgs(float x, float y, float z, int type, String skin) {
+                  pX = x; pY = y; pZ = z; pType = type; pSkin = skin;
+              }
+
+              /** Chamado depois de nativeSpawnEntity. Num mundo de outro host, o mob existe so aqui: avisa os outros para criarem um "fantasma". */
+              static void spawned(long id) throws Exception {
+                  if (replaying || id == 0 || id == -1 || !on("ghosts") || !on("master")) return;
+                  bump("hook:spawn");
+                  if (!isRemote()) {
+                      bump("spawn:servidor");
+                      tr("SPAWN", "mob no mundo do servidor id=" + id + " tipo=" + pType + " skin=" + pSkin, 30);
+                      return;
+                  }
+                  Own o = new Own();
+                  o.type = pType;
+                  o.skin = pSkin == null ? "" : pSkin;
+                  o.born = tickN;
+                  o.x = pX; o.y = pY; o.z = pZ;
+                  own.put(Long.valueOf(id), o);
+                  broadcast(gsMsg(id, o));
+                  tr("SPAWN", "mob SO LOCAL (mundo de outro host) id=" + id + " tipo=" + o.type + " skin=" + o.skin + " pos=" + o.x + "," + o.y + "," + o.z + " -> fantasma sera pedido", 60);
+              }
+
+              static void removed(long id) throws Exception {
+                  if (own.containsKey(Long.valueOf(id))) {
+                      tr("REMOVE", "mob local removido id=" + id, 60);
+                      removeOwn(id);
+                  }
+              }
+
+              static void removeOwn(long id) throws Exception {
+                  own.remove(Long.valueOf(id));
+                  JSONObject j = new JSONObject();
+                  j.put("t", "gr");
+                  j.put("id", String.valueOf(id));
+                  broadcast(j.toString());
+                  synchronized (lock) { ents.remove("o:" + id); }
+              }
+
+              static void particle(int type, float x, float y, float z, float vx, float vy, float vz, int size) {
+                  if (replaying || peers.isEmpty() || !on("particles")) return;
+                  if (pq.size() >= 200) return;
+                  bump("hook:particula");
+                  pq.add(new double[] { type, x, y, z, vx, vy, vz, size });
+              }
+
+              // ------------------------------------------------------------------ mensagens
+
+              static String iMsg(JSONArray op) throws Exception {
+                  bump("tx:i");
+                  JSONObject j = new JSONObject();
+                  j.put("t", "i");
+                  j.put("op", op);
+                  return j.toString();
+              }
+
+              static String cMsg(JSONArray a) throws Exception {
+                  bump("tx:c");
+                  JSONObject j = new JSONObject();
+                  j.put("t", "c");
+                  j.put("a", a);
+                  return j.toString();
+              }
+
+              static String rMsg(int rid) throws Exception {
+                  bump("tx:r");
+                  JSONObject j = new JSONObject();
+                  j.put("t", "r");
+                  j.put("rid", rid);
+                  return j.toString();
+              }
+
+              static String oMsg(int rid, JSONArray op) throws Exception {
+                  bump("tx:o");
+                  JSONObject j = new JSONObject();
+                  j.put("t", "o");
+                  j.put("rid", rid);
+                  j.put("op", op);
+                  return j.toString();
+              }
+
+              static String eMsg(String target, String k, JSONArray a, int ty, long pid) throws Exception {
+                  bump("tx:e");
+                  JSONObject j = new JSONObject();
+                  j.put("t", "e");
+                  j.put("ty", ty);
+                  if (pid != NONE) j.put("pid", String.valueOf(pid));
+                  j.put("T", target);
+                  j.put("k", k);
+                  j.put("a", a);
+                  return j.toString();
+              }
+
+              static String gsMsg(long id, Own o) throws Exception {
+                  bump("tx:gs");
+                  JSONObject j = new JSONObject();
+                  j.put("t", "gs");
+                  j.put("id", String.valueOf(id));
+                  j.put("x", (double) o.x);
+                  j.put("y", (double) o.y);
+                  j.put("z", (double) o.z);
+                  j.put("ty", o.type);
+                  j.put("sk", o.skin);
+                  return j.toString();
+              }
+
+              static String gpMsg(long id, Own o) throws Exception {
+                  bump("tx:gp");
+                  JSONObject j = new JSONObject();
+                  j.put("t", "gp");
+                  j.put("id", String.valueOf(id));
+                  j.put("x", (double) o.x);
+                  j.put("y", (double) o.y);
+                  j.put("z", (double) o.z);
+                  j.put("yw", (double) o.yaw);
+                  j.put("pt", (double) o.pitch);
+                  return j.toString();
+              }
+
+              static void broadcast(String line) {
+                  synchronized (peers) {
+                      for (int i = 0; i < peers.size(); i++) {
+                          Peer p = peers.get(i);
+                          if (p.out.size() < 50000) p.out.offer(line);
+                      }
+                  }
+              }
+
+              /** Roda em thread de rede. Copia o estado rapido sob o lock e monta o texto fora dele (nao trava o jogo). */
+              static void sendSnapshot(Peer p) {
+                  try {
+                      ArrayList<Integer> rids = new ArrayList<Integer>();
+                      ArrayList<ArrayList<JSONArray>> rops = new ArrayList<ArrayList<JSONArray>>();
+                      ArrayList<JSONArray> items = new ArrayList<JSONArray>();
+                      ArrayList<JSONArray> crea = new ArrayList<JSONArray>();
+                      ArrayList<Object[]> es = new ArrayList<Object[]>();
+                      synchronized (lock) {
+                          for (Map.Entry<Integer, ArrayList<JSONArray>> en : rdefs.entrySet()) {
+                              rids.add(en.getKey());
+                              rops.add(new ArrayList<JSONArray>(en.getValue()));
+                          }
+                          for (ArrayList<JSONArray> l : itemOps.values()) items.addAll(l);
+                          crea.addAll(creativeList);
+                          for (Map.Entry<String, EntState> en : ents.entrySet()) {
+                              for (Map.Entry<String, JSONArray> kv : en.getValue().m.entrySet()) {
+                                  es.add(new Object[] { en.getKey(), kv.getKey(), kv.getValue(), Integer.valueOf(en.getValue().ty), Long.valueOf(en.getValue().pid) });
+                              }
+                          }
+                      }
+                      for (int i = 0; i < rids.size(); i++) {
+                          int rid = rids.get(i).intValue();
+                          p.out.offer(rMsg(rid));
+                          for (JSONArray op : rops.get(i)) p.out.offer(oMsg(rid, op));
+                      }
+                      for (JSONArray op : items) p.out.offer(iMsg(op));
+                      for (JSONArray a : crea) p.out.offer(cMsg(a));
+                      for (Object[] e : es) p.out.offer(eMsg((String) e[0], (String) e[1], (JSONArray) e[2], ((Integer) e[3]).intValue(), ((Long) e[4]).longValue()));
+                      snapQ.add(p); // mobs locais (fantasmas) sao enviados pela thread do jogo
+                  } catch (Throwable t) {
+                      log("snapshot", t);
+                  }
+              }
+
+              // ------------------------------------------------------------------ tick (thread do jogo)
+
+              static void tick() {
+                  long tk0 = System.nanoTime();
+                  try {
+                      tick0();
+                  } finally {
+                      long dt = System.nanoTime() - tk0;
+                      tickNsSum += dt;
+                      tickCount++;
+                      if (dt > tickNsMax) tickNsMax = dt;
+                      if (dt > 30000000L) tr("LENTO", "tick demorou " + (dt / 1000000L) + "ms inbox=" + inbox.size(), 5);
+                  }
+              }
+
+              static void tick0() {
+                  tickN++;
+                  if (!started) {
+                      started = true;
+                      startSession();
+                      startNet();
+                  }
+                  if (!on("master")) return;
+                  boolean rdy = ready();
+                  if (rdy) {
+                      int n = 0;
+                      long t0 = System.nanoTime();
+                      Msg m;
+                      while ((m = inbox.poll()) != null) {
+                          try {
+                              handle(m);
+                          } catch (Throwable t) {
+                              log("handle", t);
+                          }
+                          n++;
+                          if (n >= 400 || System.nanoTime() - t0 > 6000000L) break;
+                      }
+                  } else if (tickN % 200 == 0 && !inbox.isEmpty()) {
+                      dbgN("naopronto", "mundo/jogador ainda nao pronto: " + inbox.size() + " mensagens aguardando", 10);
+                  }
+                  if (!rdy) return;
+                  try { pollGone(); } catch (Throwable t) { log("gone", t); }
+                  try { pollSnap(); } catch (Throwable t) { log("snap", t); }
+                  if (tickN % 2 == 0) { try { pollOwn(); } catch (Throwable t) { log("pollOwn", t); } }
+                  if (tickN % 4 == 0) { try { pollHand(); } catch (Throwable t) { log("pollHand", t); } }
+                  if (tickN % 20 == 5) { try { pollOther(); } catch (Throwable t) { log("pollOther", t); } }
+                  try { flushParticles(); } catch (Throwable t) { log("particles", t); }
+                  if (tickN % 20 == 0) reapply();
+                  if (tickN % 20 == 10) { try { hideGhosts(); } catch (Throwable t) { log("hide", t); } }
+                  if (tickN % 200 == 0) prune();
+                  if (tickN % 600 == 0 || tickN == 100) status();
+              }
+
+              static void pollGone() throws Exception {
+                  String pid;
+                  while ((pid = goneQ.poll()) != null) {
+                      String prefix = pid + ":";
+                      for (String key : new ArrayList<String>(gmap.keySet())) {
+                          if (key.startsWith(prefix)) {
+                              Long g = gmap.remove(key);
+                              if (g != null && present(g.longValue())) smCall("nativeRemoveEntity", g);
+                          }
+                      }
+                  }
+              }
+
+              /** Aparelho saiu (ou reconectou): esquece TUDO que ele tinha aplicado. Antes os grupos antigos ficavam e, a cada 5s,
+               *  reaplicavam o modelo velho (ex.: Freeza) por cima do novo (Goku). */
+              static void purgePeer(String pid) {
+                  int n = 0;
+                  try {
+                      for (Map.Entry<String, Group> en : new ArrayList<Map.Entry<String, Group>>(remote.entrySet())) {
+                          if (en.getValue().peer.equals(pid)) { remote.remove(en.getKey()); n++; }
+                      }
+                      String prefix = pid + ":";
+                      for (String key : new ArrayList<String>(gmap.keySet())) {
+                          if (key.startsWith(prefix)) {
+                              Long g = gmap.remove(key);
+                              if (g != null && present(g.longValue())) smCall("nativeRemoveEntity", g);
+                          }
+                      }
+                  } catch (Throwable t) {
+                      log("purgePeer", t);
+                  }
+                  dbg("limpeza do aparelho " + pid + ": " + n + " grupos de aparencia descartados");
+              }
+
+              /** Marca o render deste aparelho para ser aplicado de novo (o modelo dele foi redefinido). */
+              static void markRenderDirty(String pid) {
+                  for (Group g : new ArrayList<Group>(remote.values())) {
+                      if (!g.peer.equals(pid)) continue;
+                      Remote r = g.m.get("render");
+                      if (r != null) { r.done = false; r.tries = 0; }
+                  }
+              }
+
+              static void clearRenderer(int lid) {
+                  String[] parts = { "head", "hat", "body", "rightArm", "leftArm", "rightLeg", "leftLeg" };
+                  for (String p : parts) {
+                      try {
+                          Object ex = rmCall("nativeModelPartExists", Integer.valueOf(lid), p);
+                          if (ex instanceof Boolean && ((Boolean) ex).booleanValue()) rmCall("nativeModelClear", Integer.valueOf(lid), p);
+                      } catch (Throwable t) { }
+                  }
+              }
+              static void pollSnap() throws Exception {
+                  Peer p;
+                  while ((p = snapQ.poll()) != null) {
+                      for (Map.Entry<Long, Own> en : new ArrayList<Map.Entry<Long, Own>>(own.entrySet())) {
+                          p.out.offer(gsMsg(en.getKey().longValue(), en.getValue()));
+                      }
+                  }
+              }
+
+              static void pollOwn() throws Exception {
+                  if (own.isEmpty()) return;
+                  for (Long id : new ArrayList<Long>(own.keySet())) {
+                      Own o = own.get(id);
+                      if (o == null) continue;
+                      if (present(id.longValue())) {
+                          o.seen = true;
+                      } else {
+                          if (o.seen || tickN - o.born > 600) removeOwn(id.longValue());
+                          continue;
+                      }
+                      float x = ((Float) smCall("nativeGetEntityLoc", id, Integer.valueOf(0))).floatValue();
+                      float y = ((Float) smCall("nativeGetEntityLoc", id, Integer.valueOf(1))).floatValue();
+                      float z = ((Float) smCall("nativeGetEntityLoc", id, Integer.valueOf(2))).floatValue();
+                      float yaw = ((Float) smCall("nativeGetYaw", id)).floatValue();
+                      float pitch = ((Float) smCall("nativeGetPitch", id)).floatValue();
+                      if (Math.abs(x - o.x) > 0.03f || Math.abs(y - o.y) > 0.03f || Math.abs(z - o.z) > 0.03f
+                              || Math.abs(yaw - o.yaw) > 1f || Math.abs(pitch - o.pitch) > 1f) {
+                          o.x = x; o.y = y; o.z = z; o.yaw = yaw; o.pitch = pitch;
+                          broadcast(gpMsg(id.longValue(), o));
+                      }
+                  }
+              }
+
+              static void pollHand() throws Exception {
+                  if (peers.isEmpty() || !on("hand") || !on("master")) return;
+                  long pe = playerEnt();
+                  if (pe == NONE || !present(pe)) return;
+                  int id = ((Integer) smCall("nativeGetCarriedItem", Integer.valueOf(0))).intValue();
+                  if (id <= 0) {
+                      if (lastHandId != 0) {
+                          lastHandId = 0;
+                          tr("MAO", "EU estou com a mao vazia", 30);
+                      }
+                      return;
+                  }
+                  int dmg = ((Integer) smCall("nativeGetCarriedItem", Integer.valueOf(1))).intValue();
+                  int cnt = ((Integer) smCall("nativeGetCarriedItem", Integer.valueOf(2))).intValue();
+                  if (id != lastHandId) {
+                      lastHandId = id;
+                      tr("MAO", "EU seguro item id=" + id + " dmg=" + dmg + " qtd=" + cnt + " peers=" + peers.size(), 30);
+                  }
+                  JSONArray a = new JSONArray();
+                  a.put(id);
+                  a.put(cnt);
+                  a.put(dmg);
+                  onEnt(pe, "hand", a);
+              }
+
+              static void flushParticles() throws Exception {
+                  if (pq.isEmpty()) return;
+                  JSONArray arr = new JSONArray();
+                  for (double[] d : pq) {
+                      JSONArray a = new JSONArray();
+                      for (double v : d) a.put(v);
+                      arr.put(a);
+                  }
+                  pq.clear();
+                  JSONObject j = new JSONObject();
+                  j.put("t", "p");
+                  j.put("a", arr);
+                  broadcast(j.toString());
+              }
+
+              static void hideGhosts() throws Exception {
+                  if (myGhosts.isEmpty()) return;
+                  for (Long g : new ArrayList<Long>(myGhosts)) {
+                      if (hidden.contains(g) || !present(g.longValue())) continue;
+                      if (g.longValue() == playerEnt() || isPlayer(g.longValue())) { myGhosts.remove(g); dbg("fantasma " + g + " era jogador: nao escondido"); continue; }
+                      int rid = ensureInvis();
+                      smCall("nativeSetEntityRenderType", g, Integer.valueOf(rid));
+                      hidden.add(g);
+                      dbg("fantasma " + g + " escondido para o dono");
+                  }
+              }
+
+              static int ensureInvis() throws Exception {
+                  if (invisRid > 0) return invisRid;
+                  int rid = ((Integer) rmCall("nativeCreateHumanoidRenderer")).intValue();
+                  String[] parts = { "head", "hat", "body", "rightArm", "leftArm", "rightLeg", "leftLeg" };
+                  for (String p : parts) {
+                      try {
+                          Object ex = rmCall("nativeModelPartExists", Integer.valueOf(rid), p);
+                          if (ex instanceof Boolean && ((Boolean) ex).booleanValue()) rmCall("nativeModelClear", Integer.valueOf(rid), p);
+                      } catch (Throwable t) { }
+                  }
+                  invisRid = rid;
+                  return rid;
+              }
+
+              // ------------------------------------------------------------------ mensagens recebidas
+
+              static void handle(Msg m) throws Exception {
+                  JSONObject j = m.j;
+                  String t = j.getString("t");
+                  String pid = m.p.id;
+                  bump("rx-msg:" + t);
+                  if (t.equals("bye")) { purgePeer(pid); return; }
+                  if (m.p.dead) return; // mensagem que ficou na fila de um aparelho que ja saiu
+                  if (t.equals("e") || t.equals("gs") || t.equals("gr") || t.equals("gm") || t.equals("i") || t.equals("c")) {
+                      tr("RX", "de " + pid + ": " + cut(j.toString(), 260), 60);
+                  }
+                  if (t.equals("r")) {
+                      String key = pid + ":" + j.getInt("rid");
+                      Integer old = rmap.get(key);
+                      int ridN = j.getInt("rid");
+                      Integer mn = minRid.get(pid);
+                      if (mn == null || ridN < mn.intValue()) minRid.put(pid, Integer.valueOf(ridN));
+                      if (old != null) {
+                          // o remetente redefiniu este renderizador (entrou de novo no mundo / recarregou o mod): limpa o modelo antigo e recebe o novo
+                          crumb("redefinir renderizador " + key);
+                          clearRenderer(old.intValue());
+                          bump("r:redefinido");
+                          dbgN("rredef", "renderizador " + key + " redefinido pelo remetente: modelo antigo limpo", 30);
+                      } else {
+                          crumb("criar renderizador " + key);
+                          Object lid = rmCall("nativeCreateHumanoidRenderer");
+                          rmap.put(key, (Integer) lid);
+                      }
+                      m.p.fresh.add(key);
+                      markRenderDirty(pid);
+                  } else if (t.equals("o")) {
+                      String key = pid + ":" + j.getInt("rid");
+                      if (!m.p.fresh.contains(key)) return;
+                      Integer lid = rmap.get(key);
+                      if (lid == null) return;
+                      JSONArray op = j.getJSONArray("op");
+                      String o = op.getString(0);
+                      if ((rxOps++ & 31) == 0) crumb("modelo " + key + " " + o);
+                      if (o.equals("box")) {
+                          rmCall("nativeModelAddBox", lid, op.getString(1),
+                                  Float.valueOf((float) op.getDouble(2)), Float.valueOf((float) op.getDouble(3)), Float.valueOf((float) op.getDouble(4)),
+                                  Integer.valueOf(op.getInt(5)), Integer.valueOf(op.getInt(6)), Integer.valueOf(op.getInt(7)),
+                                  Float.valueOf((float) op.getDouble(8)),
+                                  Integer.valueOf(op.getInt(9)), Integer.valueOf(op.getInt(10)),
+                                  Boolean.valueOf(op.getBoolean(11)),
+                                  Float.valueOf((float) op.getDouble(12)), Float.valueOf((float) op.getDouble(13)));
+                      } else if (o.equals("clr")) {
+                          rmCall("nativeModelClear", lid, op.getString(1));
+                      } else if (o.equals("rot")) {
+                          rmCall("nativeModelSetRotationPoint", lid, op.getString(1),
+                                  Float.valueOf((float) op.getDouble(2)), Float.valueOf((float) op.getDouble(3)), Float.valueOf((float) op.getDouble(4)));
+                      }
+                  } else if (t.equals("e")) {
+                      String target = j.getString("T");
+                      String k = j.getString("k");
+                      boolean plr = target.startsWith("p:");
+                      if (plr && !on("players")) return;
+                      if (!plr && !on("entities")) return;
+                      bump("rx:" + k);
+                      String gk = pid + "|" + target;
+                      Group g = remote.get(gk);
+                      if (g == null) {
+                          g = new Group();
+                          g.peer = pid;
+                          g.target = target;
+                          remote.put(gk, g);
+                      }
+                      Remote r = new Remote();
+                      r.a = j.getJSONArray("a");
+                      r.ty = j.has("ty") ? j.getInt("ty") : 0;
+                      r.born = tickN;
+                      g.m.put(k, r);
+                      if (j.has("pid")) g.pid = Long.parseLong(j.getString("pid"));
+                      tryApply(g, k, r);
+                  } else if (t.equals("i")) {
+                      if (on("items")) itemApply(j.getJSONArray("op"));
+                  } else if (t.equals("c")) {
+                      if (on("items")) creativeApply(j.getJSONArray("a"));
+                  } else if (t.equals("gs")) {
+                      ghostSpawn(m, j);
+                  } else if (t.equals("gp")) {
+                      Long gid = gmap.get(pid + ":" + j.getString("id"));
+                      if (gid == null || !present(gid.longValue())) return;
+                      smCall("nativeSetPosition", gid, Float.valueOf((float) j.getDouble("x")), Float.valueOf((float) j.getDouble("y")), Float.valueOf((float) j.getDouble("z")));
+                      smCall("nativeSetRot", gid, Float.valueOf((float) j.getDouble("yw")), Float.valueOf((float) j.getDouble("pt")));
+                  } else if (t.equals("gr")) {
+                      Long gid = gmap.remove(pid + ":" + j.getString("id"));
+                      if (gid != null && present(gid.longValue())) smCall("nativeRemoveEntity", gid);
+                  } else if (t.equals("gm")) {
+                      myGhosts.add(Long.valueOf(Long.parseLong(j.getString("gid"))));
+                  } else if (t.equals("p")) {
+                      if (!on("particles")) return;
+                      JSONArray arr = j.getJSONArray("a");
+                      int cnt = arr.length();
+                      if (cnt > 100) cnt = 100;
+                      for (int i = 0; i < cnt; i++) {
+                          JSONArray a = arr.getJSONArray(i);
+                          smCall("nativeLevelAddParticle", Integer.valueOf((int) a.getDouble(0)),
+                                  Float.valueOf((float) a.getDouble(1)), Float.valueOf((float) a.getDouble(2)), Float.valueOf((float) a.getDouble(3)),
+                                  Float.valueOf((float) a.getDouble(4)), Float.valueOf((float) a.getDouble(5)), Float.valueOf((float) a.getDouble(6)),
+                                  Integer.valueOf((int) a.getDouble(7)));
+                      }
+                  }
+              }
+
+              static boolean validItem(int id) {
+                  try { return ((Boolean) smCall("nativeIsValidItem", Integer.valueOf(id))).booleanValue(); } catch (Throwable t) { return true; }
+              }
+
+              /** Mesma checagem que o ModPE.setItem faz antes de definir um item (icone inexistente derruba o jogo). */
+              static boolean hasIcon(String icon, int sub) {
+                  try {
+                      java.lang.reflect.Field f = Class.forName(SM).getDeclaredField("itemsMeta");
+                      f.setAccessible(true);
+                      Object meta = f.get(null);
+                      if (meta == null) return true;
+                      Method m = meta.getClass().getMethod("hasIcon", String.class, int.class);
+                      return ((Boolean) m.invoke(meta, icon, Integer.valueOf(sub))).booleanValue();
+                  } catch (Throwable t) {
+                      return false;
+                  }
+              }
+
+              static Object[] coerce(Method m, JSONArray op, int from) throws Exception {
+                  Class<?>[] pt = m.getParameterTypes();
+                  Object[] out = new Object[pt.length];
+                  for (int i = 0; i < pt.length; i++) {
+                      int k = from + i;
+                      if (pt[i] == int.class) out[i] = Integer.valueOf(op.getInt(k));
+                      else if (pt[i] == boolean.class) out[i] = Boolean.valueOf(op.getBoolean(k));
+                      else if (pt[i] == String.class) out[i] = op.getString(k);
+                      else if (pt[i] == float.class) out[i] = Float.valueOf((float) op.getDouble(k));
+                      else throw new Exception("tipo nao suportado " + pt[i]);
+                  }
+                  return out;
+              }
+
+              /** Replica a definicao de um item de mod (id, icone, nome, 3D na mao, propriedades) para quem nao tem o mod. */
+              static void itemApply(JSONArray op) throws Exception {
+                  String name = op.getString(0);
+                  int id = op.getInt(1);
+                  boolean def = name.equals("nativeDefineItem") || name.equals("nativeDefineSnowballItem") || name.equals("nativeDefineArmor");
+                  if (def) {
+                      if (remoteItems.contains(Integer.valueOf(id))) return;
+                      synchronized (lock) { if (itemOps.containsKey(Integer.valueOf(id))) return; } // meu proprio mod ja definiu
+                      if (validItem(id)) return;
+                      String icon = op.getString(2);
+                      int sub = op.getInt(3);
+                      if (!hasIcon(icon, sub)) {
+                          dbgN("icone", "item " + id + ": icone ausente " + icon + ":" + sub + " (instale o mesmo mod/texturas)", 20);
+                          return;
+                      }
+                      remoteItems.add(Integer.valueOf(id));
+                      dbgN("item", "definindo item remoto " + id + " (" + name + ")", 40);
+                  } else if (!remoteItems.contains(Integer.valueOf(id))) {
+                      return;
+                  }
+                  crumb("item " + id + " " + name);
+                  Method m = find(Class.forName(SM), name, op.length() - 1);
+                  try {
+                      m.invoke(null, coerce(m, op, 1));
+                  } catch (InvocationTargetException ite) {
+                      throw new Exception(String.valueOf(ite.getCause()));
+                  }
+              }
+
+              static void creativeApply(JSONArray a) throws Exception {
+                  int id = a.getInt(0);
+                  int count = a.getInt(1);
+                  int dmg = a.getInt(2);
+                  String key = id + ":" + dmg;
+                  if (creativeApplied.contains(key)) return;
+                  if (!validItem(id)) return;
+                  creativeApplied.add(key);
+                  smCall("nativeAddItemCreativeInv", Integer.valueOf(id), Integer.valueOf(count), Integer.valueOf(dmg));
+                  dbgN("criativo", "item " + id + " adicionado ao criativo", 40);
+              }
+
+              /** Recebido de quem entrou na LAN: cria no meu mundo (que e o servidor) um mob de verdade que espelha o dele. */
+              static void ghostSpawn(Msg m, JSONObject j) throws Exception {
+                  if (!on("ghosts") || isRemote()) return; // so quem hospeda pode criar entidades de servidor
+                  String key = m.p.id + ":" + j.getString("id");
+                  if (gmap.containsKey(key)) return;
+                  String sk = j.getString("sk");
+                  crumb("fantasma " + key);
+                  Object r = smCall("spawnEntityImpl", Float.valueOf((float) j.getDouble("x")), Float.valueOf((float) j.getDouble("y")),
+                          Float.valueOf((float) j.getDouble("z")), Integer.valueOf(j.getInt("ty")), sk.length() == 0 ? null : sk);
+                  long gid = ((Long) r).longValue();
+                  if (gid == 0 || gid == -1) return;
+                  gmap.put(key, Long.valueOf(gid));
+                  try { smCall("nativeEntitySetImmobile", Long.valueOf(gid), Boolean.TRUE); } catch (Throwable t) { }
+                  JSONObject re = new JSONObject();
+                  re.put("t", "gm");
+                  re.put("id", j.getString("id"));
+                  re.put("gid", String.valueOf(gid));
+                  m.p.out.offer(re.toString());
+                  dbg("fantasma criado " + key + " -> " + gid);
+              }
+
+              static void reapply() {
+                  try {
+                      for (Group g : new ArrayList<Group>(remote.values())) {
+                          boolean refresh = g.target.startsWith("p:") && tickN % 100 == 0;
+                          for (Map.Entry<String, Remote> en : new ArrayList<Map.Entry<String, Remote>>(g.m.entrySet())) {
+                              Remote r = en.getValue();
+                              if (refresh) { r.done = false; r.tries = 0; }
+                              if (r.done && !g.target.startsWith("p:")) {
+                                  long rid2 = resolve(g);
+                                  if (rid2 == NONE || !present(rid2)) r.done = false; // sumiu: aplica de novo quando voltar
+                              }
+                              if (!r.done) tryApply(g, en.getKey(), r);
+                          }
+                      }
+                  } catch (Throwable t) {
+                      log("reapply", t);
+                  }
+              }
+
+              static long resolve(Group g) {
+                  String t = g.target;
+                  try {
+                      if (t.startsWith("e:")) return Long.parseLong(t.substring(2));
+                      if (t.startsWith("o:")) {
+                          Long x = gmap.get(g.peer + ":" + t.substring(2));
+                          return x == null ? NONE : x.longValue();
+                      }
+                      if (t.startsWith("p:")) return resolvePlayer(t.substring(2), g.pid);
+                  } catch (Throwable e) { }
+                  return NONE;
+              }
+
+              /** Acha a entidade do OUTRO jogador. Nunca devolve o proprio jogador (era o que fazia o personagem sumir). */
+              static long resolvePlayer(String key, long pid) {
+                  try {
+                      long me = playerEnt();
+                      // o launcher de quem hospeda NAO registra o jogador que entrou; o id informado por ele e confiavel
+                      if (pid != NONE && pid != me) {
+                          int pty = typeOf(pid);
+                          if (pty == 63) {
+                              trResolve(key, pid, "id informado pelo remetente (tipo 63 = jogador)");
+                              return pid;
+                          }
+                          trResolve(key + "#pid", pid, "id informado NAO e jogador neste mundo (tipo=" + pty + ")");
+                      }
+                      if (allPlayers == null) allPlayers = Class.forName(SM).getField("allplayers");
+                      List<?> ap = (List<?>) allPlayers.get(null);
+                      if (ap == null) {
+                          trResolve(key, NONE, "allplayers nulo");
+                          return NONE;
+                      }
+                      LinkedHashSet<Long> cand = new LinkedHashSet<Long>(); // sem repetidos (a lista do launcher repete o host)
+                      for (Object o : new ArrayList<Object>(ap)) {
+                          long id = ((Long) o).longValue();
+                          if (id == me || !present(id)) continue;
+                          cand.add(Long.valueOf(id));
+                      }
+                      if (cand.isEmpty()) {
+                          // plano B: o jogador remoto pode nao estar em allplayers; procura entre todas as entidades
+                          if (allEntities == null) allEntities = Class.forName(SM).getField("allentities");
+                          List<?> all = (List<?>) allEntities.get(null);
+                          if (all != null) {
+                              for (Object o : new ArrayList<Object>(all)) {
+                                  long id = ((Long) o).longValue();
+                                  if (id == me) continue;
+                                  if (isPlayer(id) || typeOf(id) == 63) cand.add(Long.valueOf(id));
+                              }
+                          }
+                          if (cand.isEmpty()) {
+                              trResolve(key, NONE, "nenhum outro jogador visivel. allplayers=" + ap + " eu=" + me + " pid_informado=" + pid);
+                              dbgEvery("semjogador", 300, "nenhum outro jogador visivel. allplayers=" + ap + " eu=" + me + " pid_informado=" + pid);
+                              return NONE;
+                          }
+                      }
+                      if (cand.size() == 1) {
+                          long c = cand.iterator().next().longValue();
+                          trResolve(key, c, "unico candidato (allplayers/allentities)");
+                          return c;
+                      }
+                      for (Long id : cand) {
+                          if (key.equals(playerKey(id.longValue()))) {
+                              trResolve(key, id.longValue(), "casou pela chave");
+                              return id.longValue();
+                          }
+                      }
+                      trResolve(key, NONE, "varios candidatos " + cand + " e nenhum casou");
+                  } catch (Throwable t) {
+                      log("resolvePlayer", t);
+                  }
+                  return NONE;
+              }
+
+              static void tryApply(Group g, String k, Remote r) {
+                  if (r.done || r.tries > 100) return;
+                  if (!hasPeer(g.peer)) { r.done = true; return; } // aparelho saiu: nunca aplicar dados dele
+                  long t0 = System.nanoTime();
+                  String tag = g.target + " " + k;
+                  try {
+                      long id = resolve(g);
+                      boolean isP = g.target.startsWith("p:");
+                      boolean pres = id != NONE && present(id);
+                      if (id == NONE || (!pres && !isP)) {
+                          bump("sem-alvo:" + k);
+                          tr("APLICAR", "SEM ALVO " + tag + " id_resolvido=" + (id == NONE ? "nenhum" : String.valueOf(id)) + " presente_na_lista=" + pres + " pid_do_remetente=" + g.pid + " tentativas=" + r.tries, 15);
+                          dbgEvery("semalvo", 200, "sem alvo ainda para " + g.target + " (" + k + ")");
+                          return;
+                      }
+                      if (g.target.startsWith("e:")) {
+                          if (id == playerEnt()) return; // nunca mexe no proprio jogador por id de mob
+                          int mine = typeOf(id);
+                          if (mine == 63 || isPlayer(id) || isKnownPlayer(id)) {
+                              // o id do mob (ex.: kamehameha) caiu numa entidade que e JOGADOR neste aparelho: ids de aparelhos diferentes podem coincidir
+                              r.tries++;
+                              bump("mob-em-jogador-bloqueado");
+                              tr("APLICAR", "BLOQUEADO (modelo de mob iria para um jogador) " + tag + " id=" + id + " tipo_local=" + mine, 20);
+                              return;
+                          }
+                          if (mine <= 0 || (r.ty > 0 && mine != r.ty)) {
+                              r.tries++;
+                              bump("tipo-diferente");
+                              tr("APLICAR", "IGNORADO (tipo diferente/desconhecido) " + tag + " id=" + id + " tipo_remoto=" + r.ty + " tipo_local=" + mine, 20);
+                              return;
+                          }
+                      }
+                      crumb("aplicar " + g.target + " " + k + " em " + id);
+                      curTries = r.tries;
+                      boolean ok = apply(id, k, r.a, g.peer);
+                      long ms = (System.nanoTime() - t0) / 1000000L;
+                      tr("APLICAR", (ok ? "OK " : "FALHOU ") + tag + " id=" + id + " presente_na_lista=" + pres + " tipo_local=" + typeOf(id) + " dados=" + r.a + " " + ms + "ms tentativas=" + r.tries, 40);
+                      if (ok) {
+                          r.done = true;
+                          bump("ok:" + k + (isP ? ":jogador" : ":mob"));
+                          if (!toastedApply) {
+                              toastedApply = true;
+                              toast("ModSync: aparência sincronizada com sucesso");
+                          }
+                      } else {
+                          r.tries++;
+                          bump("falta:" + k);
+                      }
+                  } catch (Throwable t) {
+                      r.tries++;
+                      bump("erro:" + k);
+                      tr("APLICAR", "ERRO " + tag + ": " + stack(t), 20);
+                      log("apply " + k, t);
+                  }
+              }
+
+              static boolean apply(long e, String k, JSONArray a, String peerId) throws Exception {
+                  Class<?> api = Class.forName(SM + "$NativeEntityApi");
+                  Long ent = Long.valueOf(e);
+                  replaying = true;
+                  try {
+                      if (k.equals("render")) {
+                          int r = a.getInt(0);
+                          Integer lid = rmap.get(peerId + ":" + r);
+                          if (lid == null) {
+                              if (r >= 4096) return false;
+                              // so usa o id local (modelo padrao do jogo) se o outro aparelho nao tem esse id como modelo de mod;
+                              // antes qualquer id desconhecido virava o modelo local de mesmo numero (outro personagem)
+                              Integer mn = minRid.get(peerId);
+                              boolean builtin = (mn != null && r < mn.intValue()) || (mn == null && curTries >= 3);
+                              if (!builtin) {
+                                  dbgN("rfallback", "render " + peerId + ":" + r + " ainda nao definido pelo remetente: NAO uso modelo local de mesmo id", 20);
+                                  return false;
+                              }
+                              lid = Integer.valueOf(r);
+                          }
+                          invoke(api, "setRenderTypeImpl", ent, lid);
+                      } else if (k.equals("skin")) {
+                          invoke(api, "setMobSkinImpl", ent, a.getString(0), Boolean.FALSE);
+                      } else if (k.equals("carry") || k.equals("hand")) {
+                          if (a.getInt(0) <= 0) return true;
+                          if (k.equals("hand")) {
+                              if (!onDef("handapply", true)) return true;
+                              try {
+                                  Object cur = smCall("nativeEntityGetCarriedItem", ent, Integer.valueOf(0));
+                                  if (cur instanceof Integer && ((Integer) cur).intValue() == a.getInt(0)) {
+                                      bump("hand:jogo-ja-mostra"); // o proprio jogo ja sincronizou: nao mexe
+                                      return true;
+                                  }
+                              } catch (Throwable t) { }
+                              crumb("item na mao " + a.getInt(0) + " em " + e);
+                          }
+                          invoke(api, "setCarriedItem", ent, Integer.valueOf(a.getInt(0)), Integer.valueOf(a.getInt(1)), Integer.valueOf(a.getInt(2)));
+                      } else if (k.startsWith("armor")) {
+                          invoke(api, "setArmor", ent, Integer.valueOf(a.getInt(0)), Integer.valueOf(a.getInt(1)), Integer.valueOf(a.getInt(2)));
+                      }
+                  } finally {
+                      replaying = false;
+                  }
+                  return true;
+              }
+
+              static void prune() {
+                  try {
+                      synchronized (lock) {
+                          ArrayList<String> del = new ArrayList<String>();
+                          for (Map.Entry<String, EntState> en : ents.entrySet()) {
+                              String t = en.getKey();
+                              if (t.startsWith("p:")) continue;
+                              if (tickN - en.getValue().born <= 60) continue;
+                              if (t.startsWith("e:") && !present(Long.parseLong(t.substring(2)))) del.add(t);
+                              else if (t.startsWith("o:") && !own.containsKey(Long.valueOf(Long.parseLong(t.substring(2))))) del.add(t);
+                          }
+                          for (String s : del) ents.remove(s);
+                      }
+                      ArrayList<String> del2 = new ArrayList<String>();
+                      for (Map.Entry<String, Group> en : remote.entrySet()) {
+                          Group g = en.getValue();
+                          if (g.target.startsWith("p:")) continue;
+                          boolean young = false;
+                          for (Remote r : g.m.values()) {
+                              if (tickN - r.born < 1200) young = true;
+                          }
+                          if (!young) del2.add(en.getKey());
+                      }
+                      for (String s : del2) remote.remove(s);
+                  } catch (Throwable t) {
+                      log("prune", t);
+                  }
+              }
+
+              // ------------------------------------------------------------------ rede (LAN)
+
+              static void startNet() {
+                  daemon(new Runnable() { public void run() { acceptLoop(); } });
+                  daemon(new Runnable() { public void run() { udpRx(); } });
+                  daemon(new Runnable() { public void run() { udpTx(); } });
+              }
+
+              static void daemon(Runnable r) {
+                  Thread t = new Thread(r);
+                  t.setDaemon(true);
+                  t.start();
+              }
+
+              static void acceptLoop() {
+                  try {
+                      ServerSocket ss = new ServerSocket(PORT);
+                      while (true) {
+                          final Socket s = ss.accept();
+                          daemon(new Runnable() { public void run() { handshake(s); } });
+                      }
+                  } catch (Throwable t) {
+                      log("accept", t);
+                  }
+              }
+
+              static void handshake(Socket s) {
+                  try {
+                      s.setSoTimeout(5000);
+                      s.setTcpNoDelay(true);
+                      s.getOutputStream().write(("ID|" + ID + "\n").getBytes("UTF-8"));
+                      s.getOutputStream().flush();
+                      BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
+                      String line = br.readLine();
+                      if (line == null || !line.startsWith("ID|")) {
+                          s.close();
+                          return;
+                      }
+                      String pid = line.substring(3).trim();
+                      s.setSoTimeout(0);
+                      final Peer p = new Peer(s, pid);
+                      Peer antigo = null;
+                      synchronized (peers) {
+                          for (Peer o : peers) {
+                              if (o.id.equals(pid)) { antigo = o; break; }
+                          }
+                      }
+                      if (antigo != null) {
+                          dbg("aparelho " + pid + " reconectou: descartando a conexao antiga");
+                          antigo.close(); // enfileira o "bye" antes de qualquer mensagem da conexao nova
+                      }
+                      synchronized (peers) { peers.add(p); }
+                      p.start();
+                      sendSnapshot(p);
+                      tr("REDE", "peer conectado id=" + pid + " remoto=" + s.getRemoteSocketAddress() + " local=" + s.getLocalSocketAddress(), 20);
+                      dbg("peer conectado " + pid);
+                      toast("ModSync: conectado a outro aparelho");
+                  } catch (Throwable t) {
+                      try { s.close(); } catch (Throwable x) { }
+                      log("handshake", t);
+                  }
+              }
+
+              static boolean hasPeer(String id) {
+                  synchronized (peers) {
+                      for (Peer o : peers) if (o.id.equals(id)) return true;
+                  }
+                  return false;
+              }
+
+              static void udpRx() {
+                  try {
+                      DatagramSocket ds = new DatagramSocket(null);
+                      ds.setReuseAddress(true);
+                      ds.bind(new InetSocketAddress(PORT));
+                      byte[] buf = new byte[256];
+                      while (true) {
+                          DatagramPacket pk = new DatagramPacket(buf, buf.length);
+                          ds.receive(pk);
+                          String msg = new String(pk.getData(), 0, pk.getLength(), "UTF-8");
+                          String[] parts = msg.split("\\|");
+                          if (parts.length < 3 || !parts[0].equals("MSYNC1")) continue;
+                          final String id = parts[1];
+                          if (!id.equals(ID)) tr("DESCOBERTA", "hello de " + pk.getAddress() + " id=" + id + " ja_conectado=" + hasPeer(id), 2);
+                          if (id.equals(ID) || hasPeer(id)) continue;
+                          // so um dos lados conecta (o de ID menor), para nao duplicar
+                          if (ID.compareTo(id) >= 0) continue;
+                          synchronized (connecting) {
+                              if (connecting.contains(id)) continue;
+                              connecting.add(id);
+                          }
+                          final InetAddress addr = pk.getAddress();
+                          final int port = Integer.parseInt(parts[2].trim());
+                          daemon(new Runnable() {
+                              public void run() {
+                                  try {
+                                      Socket s = new Socket();
+                                      s.connect(new InetSocketAddress(addr, port), 3000);
+                                      handshake(s);
+                                  } catch (Throwable t) {
+                                      log("connect", t);
+                                  }
+                                  synchronized (connecting) { connecting.remove(id); }
+                              }
+                          });
+                      }
+                  } catch (Throwable t) {
+                      log("udpRx", t);
+                  }
+              }
+
+              static void udpTx() {
+                  try {
+                      DatagramSocket ds = new DatagramSocket();
+                      ds.setBroadcast(true);
+                      byte[] data = ("MSYNC1|" + ID + "|" + PORT).getBytes("UTF-8");
+                      while (true) {
+                          if (peers.isEmpty()) {
+                              ArrayList<InetAddress> targets = new ArrayList<InetAddress>();
+                              try { targets.add(InetAddress.getByName("255.255.255.255")); } catch (Throwable t) { }
+                              try {
+                                  Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces();
+                                  while (en != null && en.hasMoreElements()) {
+                                      NetworkInterface ni = en.nextElement();
+                                      if (!ni.isUp() || ni.isLoopback()) continue;
+                                      for (InterfaceAddress ia : ni.getInterfaceAddresses()) {
+                                          if (ia.getBroadcast() != null) targets.add(ia.getBroadcast());
+                                      }
+                                  }
+                              } catch (Throwable t) { }
+                              for (InetAddress a : targets) {
+                                  try { ds.send(new DatagramPacket(data, data.length, a, PORT)); } catch (Throwable t) { }
+                              }
+                              tr("DESCOBERTA", "enviando hello para " + targets, 1);
+                          }
+                          Thread.sleep(2000);
+                      }
+                  } catch (Throwable t) {
+                      log("udpTx", t);
+                  }
+              }
+          }
+          JAVA
+
+      - name: Escrever patch.py
+        run: |
+          cat > patch.py <<'PY'
+          import glob, os, re, sys
+
+          H = "Lnet/zhuoweizhang/mcpelauncher/ModHooks;"
+          SM = "net/zhuoweizhang/mcpelauncher/ScriptManager"
+          RM = "net/zhuoweizhang/mcpelauncher/api/modpe/RendererManager"
+
+          # (classe, método nativo, descritor dos parâmetros)  -> hook inserido ANTES da chamada original
+          BEFORE = [
+              (SM, "nativeSetEntityRenderType", "JI"),
+              (SM, "nativeSetMobSkin", "JLjava/lang/String;"),
+              (SM, "nativeSetCarriedItem", "JIII"),
+              (SM, "nativeMobSetArmor", "JIII"),
+              (SM, "nativeSpawnEntity", "FFFILjava/lang/String;"),
+              (SM, "nativeRemoveEntity", "J"),
+              (SM, "nativeLevelAddParticle", "IFFFFFFI"),
+              (SM, "nativeDefineItem", "ILjava/lang/String;ILjava/lang/String;I"),
+              (SM, "nativeDefineSnowballItem", "ILjava/lang/String;ILjava/lang/String;I"),
+              (SM, "nativeDefineArmor", "ILjava/lang/String;ILjava/lang/String;Ljava/lang/String;III"),
+              (SM, "nativeItemSetProperties", "ILjava/lang/String;"),
+              (SM, "nativeSetHandEquipped", "IZ"),
+              (SM, "nativeSetItemCategory", "III"),
+              (SM, "nativeSetItemMaxDamage", "II"),
+              (SM, "nativeItemSetUseAnimation", "II"),
+              (SM, "nativeItemSetStackedByData", "IZ"),
+              (SM, "nativeAddItemCreativeInv", "III"),
+              (RM, "nativeModelAddBox", "ILjava/lang/String;FFFIIIFIIZFF"),
+              (RM, "nativeModelClear", "ILjava/lang/String;"),
+              (RM, "nativeModelSetRotationPoint", "ILjava/lang/String;FFF"),
+          ]
+
+          report = []
+          counts = {}
+
+          # ganchos no INICIO de metodos do launcher (so registram eventos para o log)
+          START_HOOKS = [
+              (r"^\.method .*\bentityAddedCallback\(J\)V", "invoke-static {p0, p1}, %s->entityAdded(J)V", "entityAdded"),
+              (r"^\.method .*\bentityRemovedCallback\(J\)V", "invoke-static {p0, p1}, %s->entityRemoved(J)V", "entityRemoved"),
+              (r"^\.method .*\bplayerAddedHandler\(J\)V", "invoke-static {p0, p1}, %s->playerAdded(J)V", "playerAdded"),
+              (r"^\.method .*\bplayerRemovedHandler\(J\)V", "invoke-static {p0, p1}, %s->playerRemoved(J)V", "playerRemoved"),
+              (r"^\.method .*\brakNetConnectCallback\(Ljava/lang/String;I\)V", "invoke-static {p0, p1}, %s->connect(Ljava/lang/String;I)V", "connect"),
+          ]
+          EXPECTED = ["nativeSetEntityRenderType", "nativeSetMobSkin", "nativeSetCarriedItem", "nativeMobSetArmor",
+                      "nativeModelAddBox", "nativeModelClear", "nativeModelSetRotationPoint", "createRenderer",
+                      "nativeSpawnEntity", "spawned", "nativeRemoveEntity", "nativeLevelAddParticle",
+                      "nativeDefineItem", "nativeAddItemCreativeInv", "nativeSetHandEquipped", "nativeItemSetProperties",
+                      "scriptsSempreLigados", "novoMundo+scriptsLigados", "scriptError",
+                      "entityAdded", "entityRemoved", "playerAdded", "playerRemoved", "connect"]
+
+          def insert_at_method_start(text, header_re, line, need_free_v0=False):
+              lines = text.split("\n")
+              for i, ln in enumerate(lines):
+                  if re.match(header_re, ln):
+                      if need_free_v0:
+                          okl = False
+                          for q in range(i + 1, min(i + 6, len(lines))):
+                              mm = re.match(r"\s*\.locals (\d+)", lines[q])
+                              if mm and int(mm.group(1)) >= 1:
+                                  okl = True
+                          if not okl:
+                              return text, False
+                      in_ann = False
+                      for j in range(i + 1, len(lines)):
+                          st = lines[j].strip()
+                          if st.startswith(".end method"):
+                              return text, False
+                          if st.startswith(".annotation"):
+                              in_ann = True
+                              continue
+                          if in_ann:
+                              if st.startswith(".end annotation"):
+                                  in_ann = False
+                              continue
+                          if st == "" or st.startswith(".") or st.startswith("#"):
+                              continue
+                          lines.insert(j, "    " + line)
+                          return "\n".join(lines), True
+              return text, False
+
+          files = glob.glob("app/smali*/**/*.smali", recursive=True)
+          if not files:
+              sys.exit("ERRO: nenhum arquivo smali encontrado")
+
+          tick_ok = False
+          app_ok = False
+
+          for f in files:
+              s = open(f, encoding="utf-8").read()
+              orig = s
+
+              for cls, name, params in BEFORE:
+                  pat = re.compile(
+                      r"^([ \t]*)invoke-static(/range)? (\{[^}]*\}), L%s;->%s\((.*?)\)(.)[ \t]*$"
+                      % (re.escape(cls), name), re.M)
+
+                  def rep(m, name=name, params=params):
+                      if m.group(4) != params:
+                          report.append("IGNORADO %s: descritor %s diferente do esperado %s" % (name, m.group(4), params))
+                          return m.group(0)
+                      counts[name] = counts.get(name, 0) + 1
+                      return "%sinvoke-static%s %s, %s->h_%s(%s)V\n%s" % (
+                          m.group(1), m.group(2) or "", m.group(3), H, name, params, m.group(0))
+
+                  s = pat.sub(rep, s)
+
+              # criação de renderizador: hook logo depois do move-result
+              pat = re.compile(
+                  r"(invoke-static(?:/range)? \{\}, L[^;]+;->\w*[Cc]reateHumanoidRenderer\w*\(\)I[ \t]*\n"
+                  r"(?:[ \t]*(?:\.line \d+|#.*)?\n)*[ \t]*move-result ([vp]\d+))")
+
+              def rep2(m):
+                  counts["createRenderer"] = counts.get("createRenderer", 0) + 1
+                  return "%s\n    invoke-static {%s}, %s->h_rendererCreated(I)V" % (m.group(1), m.group(2), H)
+
+              s = pat.sub(rep2, s)
+
+              # depois de nativeSpawnEntity: captura o id do mob criado (move-result-wide)
+              pat3 = re.compile(
+                  r"(invoke-static(?:/range)? \{[^}]*\}, L%s;->nativeSpawnEntity\(FFFILjava/lang/String;\)J[ \t]*\n"
+                  r"(?:[ \t]*(?:\.line \d+|#.*)?\n)*[ \t]*move-result-wide ([vp])(\d+))" % re.escape(SM))
+
+              def rep3(m):
+                  counts["spawned"] = counts.get("spawned", 0) + 1
+                  n = int(m.group(3))
+                  return "%s\n    invoke-static {%s%d, %s%d}, %s->h_spawned(J)V" % (m.group(1), m.group(2), n, m.group(2), n + 1, H)
+
+              s = pat3.sub(rep3, s)
+
+              # scripts sempre ligados ao entrar em servidor (o launcher desliga se o endereco nao for local)
+              pat4 = re.compile(
+                  r"(invoke-static(?:/range)? \{[^}]*\}, L%s;->isLocalAddress\(Ljava/lang/String;\)Z[ \t]*\n"
+                  r"(?:[ \t]*(?:\.line \d+|#.*)?\n)*[ \t]*move-result ([vp]\d+))" % re.escape(SM))
+
+              def rep4(m):
+                  counts["scriptsSempreLigados"] = counts.get("scriptsSempreLigados", 0) + 1
+                  return "%s\n    const/16 %s, 0x1" % (m.group(1), m.group(2))
+
+              s = pat4.sub(rep4, s)
+
+              base = os.path.basename(f)
+              if base == "ScriptManager.smali":
+                  s, ok = insert_at_method_start(
+                      s, r"^\.method .*\btickCallback\(\)V", "invoke-static {}, %s->tick()V" % H)
+                  tick_ok = tick_ok or ok
+                  s, ok3 = insert_at_method_start(
+                      s, r"^\.method .*\bsetLevelFakeCallback\(ZZ\)V",
+                      "const/4 v0, 0x1\n    sput-boolean v0, L%s;->scriptingEnabled:Z\n    invoke-static {p0, p1}, %s->newLevel(ZZ)V" % (SM, H),
+                      need_free_v0=True)
+                  if ok3:
+                      counts["novoMundo+scriptsLigados"] = counts.get("novoMundo+scriptsLigados", 0) + 1
+                  s, ok4 = insert_at_method_start(
+                      s, r"^\.method .*\breportScriptError\(L[^;]+;Ljava/lang/Throwable;\)V",
+                      "invoke-static {p0, p1}, %s->scriptError(Ljava/lang/Object;Ljava/lang/Throwable;)V" % H)
+                  if ok4:
+                      counts["scriptError"] = counts.get("scriptError", 0) + 1
+                  for hdr, call, label in START_HOOKS:
+                      s, okx = insert_at_method_start(s, hdr, call % H)
+                      if okx:
+                          counts[label] = counts.get(label, 0) + 1
+              if base == "BlockLauncher.smali":
+                  pat = re.compile(r"^([ \t]*)(invoke-super \{p0\}, Landroid/app/Application;->onCreate\(\)V)[ \t]*$", re.M)
+                  s2, n = pat.subn(
+                      lambda m: "%s%s\n%sinvoke-static {p0}, %s->app(Landroid/content/Context;)V" % (m.group(1), m.group(2), m.group(1), H), s)
+                  if n:
+                      s = s2
+                      app_ok = True
+
+              if s != orig:
+                  open(f, "w", encoding="utf-8").write(s)
+
+          report.append("tick: %s | app: %s" % (tick_ok, app_ok))
+          for k in sorted(counts):
+              report.append("hook %s: %d ponto(s)" % (k, counts[k]))
+          for k in EXPECTED:
+              if k not in counts:
+                  report.append("AUSENTE (gancho nao encontrado no smali): " + k)
+          bi = "\n".join(report)
+          esc = bi.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+          os.makedirs("src/net/zhuoweizhang/mcpelauncher", exist_ok=True)
+          open("src/net/zhuoweizhang/mcpelauncher/BuildInfo.java", "w").write(
+              'package net.zhuoweizhang.mcpelauncher;\npublic class BuildInfo {\n    public static final String VERSION = "v11.1";\n    public static final String REPORT = "' + esc + '";\n}\n')
+          open("patch-report.txt", "w").write("\n".join(report) + "\n")
+          print("\n".join(report))
+
+          if not tick_ok:
+              sys.exit("ERRO: não achei ScriptManager.tickCallback() para ligar o MobSync")
+          if counts.get("nativeSetEntityRenderType", 0) == 0 or counts.get("createRenderer", 0) == 0:
+              sys.exit("ERRO: pontos principais (render/criação de modelo) não encontrados")
+          PY
+
+      - name: Diagnóstico (renderizador)
+        run: grep -rn -A2 "HumanoidRenderer" app/smali* | head -30 || true
+
+      - name: Injetar hooks no smali
+        run: python3 patch.py
+
+      - name: Escrever fixsdk.py (Android 14/15 exige targetSdk >= 23)
+        run: |
+          cat > fixsdk.py <<'PY'
+          import re, struct, sys
+
+          PATH = "app/AndroidManifest.xml"
+          NEW = 23  # minimo que o Android 14/15 aceita instalar
+
+          d = bytearray(open(PATH, "rb").read())
+
+          if d[:1] == b"<":  # manifest em texto (caso o apktool tenha decodificado)
+              t = d.decode("utf-8")
+              t2, n = re.subn(r'(android:targetSdkVersion=")\d+(")', r"\g<1>%d\2" % NEW, t)
+              if n == 0:
+                  t2 = t.replace("<uses-sdk", '<uses-sdk android:targetSdkVersion="%d"' % NEW, 1)
+              open(PATH, "w", encoding="utf-8").write(t2)
+              print("manifest texto: targetSdk ->", NEW)
+              sys.exit(0)
+
+          u16 = lambda o: struct.unpack_from("<H", d, o)[0]
+          u32 = lambda o: struct.unpack_from("<I", d, o)[0]
+
+          off = 8
+          strings = []
+          done = False
+          while off < len(d) and not done:
+              t, sz = u16(off), u32(off + 4)
+              if t == 0x0001:
+                  sc, flags, so = u32(off + 8), u32(off + 16), u32(off + 20)
+                  for i in range(sc):
+                      p = off + so + u32(off + 28 + 4 * i)
+                      if flags & 0x100:
+                          l = d[p]; p += 1
+                          if l & 0x80: p += 1
+                          l2 = d[p]; p += 1
+                          if l2 & 0x80:
+                              l2 = ((l2 & 0x7F) << 8) | d[p]; p += 1
+                          strings.append(bytes(d[p:p + l2]).decode("utf8", "replace"))
+                      else:
+                          l = u16(p); p += 2
+                          if l & 0x8000:
+                              l = ((l & 0x7FFF) << 16) | u16(p); p += 2
+                          strings.append(bytes(d[p:p + l * 2]).decode("utf-16le", "replace"))
+              elif t == 0x0102 and strings[u32(off + 20)] == "uses-sdk":
+                  for i in range(u16(off + 28)):
+                      a = off + 36 + 20 * i
+                      if strings[u32(a + 4)] == "targetSdkVersion":
+                          old = u32(a + 16)
+                          struct.pack_into("<I", d, a + 16, NEW)
+                          struct.pack_into("<I", d, a + 8, 0xFFFFFFFF)
+                          d[a + 15] = 0x10
+                          print("targetSdk: %d -> %d" % (old, NEW))
+                          done = True
+              off += sz
+
+          if not done:
+              sys.exit("ERRO: targetSdkVersion nao encontrado no manifest")
+          open(PATH, "wb").write(d)
+          PY
+
+      - name: Subir targetSdk para 23
+        run: python3 fixsdk.py
+
+      - name: Compilar para dex (vira classes2.dex)
+        run: |
+          ANDROID_JAR=$(ls -d $ANDROID_HOME/platforms/android-*/android.jar | sort -V | tail -1)
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          echo "BT=$BT" >> $GITHUB_ENV
+          mkdir -p classes dexout
+          javac --release 8 -Xlint:-options -cp "$ANDROID_JAR" -d classes src/net/zhuoweizhang/mcpelauncher/*.java
+          "$BT/d8" --min-api 21 --lib "$ANDROID_JAR" --output dexout $(find classes -name '*.class')
+          cp dexout/classes.dex classes2.dex
+
+      - name: Recompilar
+        run: |
+          java -jar apktool.jar b app -o unsigned.apk
+          zip -j unsigned.apk classes2.dex
+
+      - name: Alinhar e assinar
+        run: |
+          if [ ! -f release.jks ]; then
+            keytool -genkeypair -keystore release.jks -storepass mobsync123 -keypass mobsync123 \
+              -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=MobSync"
+          fi
+          "$BT/zipalign" -f -p 4 unsigned.apk aligned.apk
+          "$BT/apksigner" sign --ks release.jks --ks-pass pass:mobsync123 --key-pass pass:mobsync123 \
+            --out editado-mobsync.apk aligned.apk
+          "$BT/apksigner" verify editado-mobsync.apk
+          "$BT/aapt" dump badging editado-mobsync.apk | grep -E "^(package|sdkVersion|targetSdkVersion|native-code)" | tee -a patch-report.txt || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: editado-mobsync-apk
+          path: |
+            editado-mobsync.apk
+            patch-report.txt
