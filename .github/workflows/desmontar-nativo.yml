@@ -1,0 +1,156 @@
+name: Desmontar codigo nativo
+
+on:
+  workflow_dispatch:
+
+jobs:
+  desmontar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar ferramentas ARM (objdump que entende ARM/Thumb)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y binutils-arm-linux-gnueabihf
+          arm-linux-gnueabihf-objdump --version | head -1
+
+      - name: Localizar o APK e extrair as bibliotecas nativas
+        run: |
+          APK=$(find . -type f -iname '*.apk' -not -path './.git/*' | head -1)
+          if [ -z "$APK" ]; then echo "ERRO: nenhum .apk no repositorio (suba o editado.apk)"; exit 1; fi
+          echo "APK encontrado: $APK"
+          mkdir -p libs
+          unzip -o -q "$APK" 'lib/armeabi-v7a/libminecraftpe.so' 'lib/armeabi-v7a/libmcpelauncher.so' -d libs
+          ls -l libs/lib/armeabi-v7a
+
+      - name: Escrever o desmontador
+        run: |
+          cat > desmontar.py <<'PY'
+          import os, re, subprocess, sys
+
+          OBJDUMP = os.environ.get("OBJDUMP", "arm-linux-gnueabihf-objdump")
+          READELF = os.environ.get("READELF", "readelf")
+          LIBDIR = os.environ.get("LIBDIR", "libs/lib/armeabi-v7a")
+          OUT = os.environ.get("OUT", "saida")
+          MAXSZ = 14000
+          os.makedirs(OUT, exist_ok=True)
+
+
+          def run(cmd, inp=None):
+              return subprocess.run(cmd, input=inp, capture_output=True, text=True).stdout
+
+
+          def demangle(text):
+              return run(["c++filt"], text)
+
+
+          def dynsyms(path):
+              out = run([READELF, "-Ws", "--dyn-syms", path])
+              res = []
+              for ln in out.splitlines():
+                  p = ln.split()
+                  if len(p) >= 8 and p[3] == "FUNC" and p[6] != "UND":
+                      try:
+                          res.append((int(p[1], 16), int(p[2], 0), p[7].split("@")[0]))
+                      except ValueError:
+                          pass
+              return res
+
+
+          def disasm(path, addr, size, names):
+              thumb = bool(addr & 1)
+              a = addr & ~1
+              cmd = [OBJDUMP, "-d", "-w", "--start-address=0x%x" % a, "--stop-address=0x%x" % (a + size)]
+              if thumb:
+                  cmd += ["-M", "force-thumb"]
+              cmd.append(path)
+              txt = run(cmd)
+              out = []
+              for ln in txt.splitlines():
+                  m = re.search(r"\b(?:bl|blx|b\.w|b)\s+([0-9a-f]{3,8})\b(?!\s*<)", ln)
+                  if m:
+                      t = int(m.group(1), 16)
+                      nm = names.get(t) or names.get(t | 1) or names.get(t & ~1)
+                      if nm:
+                          ln += "    ; -> " + nm
+                  out.append(ln)
+              return demangle("\n".join(out))
+
+
+          def nameindex(syms, dem):
+              d = {}
+              for (addr, size, mg), dm in zip(syms, dem):
+                  d[addr] = dm
+                  d[addr & ~1] = dm
+              return d
+
+
+          def dump(path, syms, dem, rx, fname, index, label):
+              names = nameindex(syms, dem)
+              done = set()
+              n = 0
+              with open(os.path.join(OUT, fname), "w") as f:
+                  for (addr, size, mg), dm in zip(syms, dem):
+                      if size == 0 or not rx.search(dm):
+                          continue
+                      key = addr & ~1
+                      if key in done:
+                          continue
+                      done.add(key)
+                      if size > MAXSZ:
+                          index.append("[%s] PULADO (grande, %d bytes): %s" % (label, size, dm))
+                          continue
+                      f.write("\n######## %s\n######## mangled=%s addr=0x%x tamanho=%d modo=%s\n" % (dm, mg, addr, size, "thumb" if addr & 1 else "arm"))
+                      f.write(disasm(path, addr, size, names) + "\n")
+                      index.append("[%s] %6d bytes  %s" % (label, size, dm))
+                      n += 1
+              return n
+
+
+          index = []
+          # ---------- biblioteca do jogo
+          game = os.path.join(LIBDIR, "libminecraftpe.so")
+          gs = dynsyms(game)
+          gd = demangle("\n".join(s[2] for s in gs)).split("\n")[:len(gs)]
+          CATS = [
+              ("mao_e_equipamento.txt", "mao",
+               r"^(Player::(getCarriedItem|setEquippedSlot|getSelectedItem|sendInventory|isLocalPlayer|getUUID)\b|Mob::(getCarriedItem|setCarriedItem|getArmor|setArmor)\b"
+               r"|RemotePlayer::|HumanoidMobRenderer::|MobRenderer::prepareCarriedItem|Inventory::(setItem|selectSlot|getSelected\w*|getItem|add)\b"
+               r"|\w*NetworkHandler::handle\(RakNet::RakNetGUID const&, (MobEquipmentPacket|MobArmorEquipmentPacket|PlayerEquipmentPacket|ContainerSetSlotPacket)\*\)"
+               r"|(MobEquipmentPacket|MobArmorEquipmentPacket)::)"),
+              ("entrada_de_jogador.txt", "entrada",
+               r"^(Level::(addPlayer|addEntity|addGlobalEntity|removeEntity|getEntity|addListener|_addListener)\b|LevelListener::|AddPlayerPacket::|ServerPlayer::ServerPlayer|Player::Player"
+               r"|\w*NetworkHandler::(onNewClient|onDisconnect|_createNewPlayer)\b"
+               r"|\w*NetworkHandler::handle\(RakNet::RakNetGUID const&, (LoginPacket|AddPlayerPacket|AddEntityPacket|AddMobPacket|StartGamePacket|PlayerListPacket|SetEntityDataPacket)\*\))"),
+              ("renderizador.txt", "render",
+               r"^(EntityRenderDispatcher::|Entity::queryEntityRenderer|EntityRenderer::(EntityRenderer|render\w*)|MobRenderer::(render|renderModel|getSkinPtr)|HumanoidMobRenderer::getSkinPtr)"),
+              ("dados_sincronizados.txt", "dados",
+               r"^(SynchedEntityData::|SetEntityDataPacket::|Entity::(getEntityData|setNameTag|getNameTag)\b)"),
+          ]
+          for fname, label, pat in CATS:
+              n = dump(game, gs, gd, re.compile(pat), fname, index, label)
+              index.append("== %s: %d funcoes" % (fname, n))
+
+          # ---------- biblioteca do launcher (BlockLauncher)
+          bl = os.path.join(LIBDIR, "libmcpelauncher.so")
+          bs = dynsyms(bl)
+          bd = demangle("\n".join(s[2] for s in bs)).split("\n")[:len(bs)]
+          n = dump(bl, bs, bd, re.compile(r"^bl_"), "launcher_bl.txt", index, "bl")
+          index.append("== launcher_bl.txt: %d funcoes" % n)
+          n = dump(bl, bs, bd, re.compile(r"^Java_.*(Entity|Render|Skin|Carried|Player|Spawn|UUID|NameTag|Particle|Item|SetPosition|SetRot)"), "launcher_jni.txt", index, "jni")
+          index.append("== launcher_jni.txt: %d funcoes" % n)
+
+          with open(os.path.join(OUT, "indice.txt"), "w") as f:
+              f.write("\n".join(index) + "\n")
+          print("\n".join(l for l in index if l.startswith("==")))
+          print("total de linhas no indice:", len(index))
+          PY
+
+      - name: Desmontar as funcoes escolhidas
+        run: python3 desmontar.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codigo-nativo
+          path: saida
